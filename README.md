@@ -15,7 +15,7 @@ This is an Arch Linux package for the `yt-fzf.sh` script.
 ## Installation (Arch Linux)
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/yannsi/yt-fzf-sh
 cd yt-fzf-sh
 makepkg -si
 ```
