@@ -73,9 +73,10 @@ TEMP_LIST=$(mktemp)     # fzf に渡す一覧
 TEMP_ERR=$(mktemp)      # 検索時のエラー出力
 TEMP_PATHS=$(mktemp)    # 保存されたファイルのパス
 TEMP_MARKER=$(mktemp)   # ダウンロード開始時刻の目印（スキップ判定用）
+TEMP_PLAYLOG=$(mktemp)  # 再生時の mpv の出力（失敗したときの表示用）
 
 cleanup() {
-    rm -f "$TEMP_RESULT" "$TEMP_LIST" "$TEMP_ERR" "$TEMP_PATHS" "$TEMP_MARKER"
+    rm -f "$TEMP_RESULT" "$TEMP_LIST" "$TEMP_ERR" "$TEMP_PATHS" "$TEMP_MARKER" "$TEMP_PLAYLOG"
 }
 trap cleanup EXIT
 
@@ -102,6 +103,8 @@ show_status() {
 wait_key() {
     echo "キーを押すとメニューに戻ります..."
     read -rsn 1
+    # 結果表示やエラーが次のメニューの上に残り続けないよう、画面を消してから戻る
+    clear
 }
 
 # 利用可能なクリップボードツールで文字列をコピーする。
@@ -278,7 +281,21 @@ play_stream() {
         --network-timeout=10 \
         --script-opts="ytdl_hook-ytdl_path=$(command -v yt-dlp)" \
         --ytdl-raw-options="force-ipv4=,no-playlist=" \
-        "$url" > /dev/null 2>&1
+        "$url" > "$TEMP_PLAYLOG" 2>&1
+    local rc=$?
+
+    # 「再生中...」の行を消す（消さないと、再生するたびに画面に積み重なる）
+    # \033[1A = 1行上へ、\r = 行頭へ、\033[2K = その行を消去
+    printf '\033[1A\r\033[2K'
+
+    # mpv の終了コード: 0 = 普通に終了（Q / ウィンドウを閉じる）、4 = Ctrl+C など
+    # それ以外は再生に失敗しているので、理由がわかるようにエラーを表示する
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 4 ]; then
+        show_status "$C_ERR" "再生できませんでした"
+        grep -iE "error|failed|unable" "$TEMP_PLAYLOG" | tail -n 3 | sed 's/^/  /'
+        echo "URL を確認してください。yt-dlp -U で更新すると直ることがあります。"
+        wait_key
+    fi
 }
 
 run_download() {
