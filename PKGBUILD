@@ -5,12 +5,16 @@
 
 pkgname=yt-fzf
 pkgver=1.0.1
-pkgrel=1
+pkgrel=2
 pkgdesc="Search, stream and download YouTube videos from an fzf menu"
 arch=('any')
 url="https://github.com/yannsi/yt-fzf-sh"
 license=('MIT')
 depends=('bash' 'fzf' 'yt-dlp' 'ffmpeg')
+# 以前は yt-fzf-sh という名前でパッケージにしていたため、同じ /usr/bin/yt-fzf を持つ。
+# 入れ替えられるようにしておく（インストール時に yt-fzf-sh を削除するか聞かれる）。
+conflicts=('yt-fzf-sh')
+replaces=('yt-fzf-sh')
 optdepends=(
     'mpv: streaming playback'
     'wl-clipboard: copy URL to clipboard (Wayland)'
