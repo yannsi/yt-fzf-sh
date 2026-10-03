@@ -624,6 +624,9 @@ while true; do
             --print $'[%(uploader,channel|不明)s] %(title)s [%(duration_string|)s]\t%(id)s' \
             "ytsearch15:$QUERY" > "$TEMP_RESULT" 2> "$TEMP_ERR"
 
+        # 「[ 検索中... ]」の行を消す（消さないと、検索するたびに画面に積み重なる）
+        printf '\033[1A\r\033[2K'
+
         if [ ! -s "$TEMP_RESULT" ]; then
             if grep -q "ERROR" "$TEMP_ERR"; then
                 show_status "$C_ERR" "検索に失敗しました"
