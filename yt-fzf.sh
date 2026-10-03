@@ -8,7 +8,7 @@
 
 # --- 設定 ---
 # バージョン（PKGBUILD の pkgver と同じ値にする）
-VERSION="1.0.4"
+VERSION="1.0.5"
 
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
@@ -301,15 +301,58 @@ play_stream() {
     fi
 }
 
+# ライブ配信中・配信開始前の動画は保存しない。
+#   $1 = URL
+#   $2 = 検索結果から分かっている配信の状態（is_live / is_upcoming / not_live など。不明なら空）
+# 保存してよければ 0、ライブ配信なので保存しないなら 1 を返す。
+# （配信中の動画をダウンロードすると、配信が終わるまで録画し続けて終わらないため）
+check_not_live() {
+    local url="$1" status="$2"
+
+    # 検索結果で「配信ではない」と分かっていれば、確認のための通信はしない
+    case "$status" in
+        not_live|was_live|post_live) return 0 ;;
+    esac
+
+    # URL 指定のときなど、状態が分からなければ yt-dlp で確認する
+    # （--ignore-no-formats-error: 配信開始前の動画でもエラーで止まらず状態を返させる）
+    if [ "$status" != "is_live" ] && [ "$status" != "is_upcoming" ]; then
+        show_status "$C_MAIN" "[ ライブ配信かどうか確認中... ]"
+        status=$(yt-dlp --no-playlist --skip-download --ignore-no-formats-error \
+            --no-warnings --print "%(live_status|)s" "$url" 2>/dev/null | tail -n 1)
+        printf '\033[1A\r\033[2K'   # 「確認中」の行を消す
+    fi
+
+    case "$status" in
+        is_live)
+            show_status "$C_ERR" "ライブ配信中の動画は保存できません"
+            echo "  配信が終わってから保存してください。再生（STREAM）はできます。"
+            wait_key
+            return 1 ;;
+        is_upcoming)
+            show_status "$C_ERR" "配信開始前のライブ配信は保存できません"
+            echo "  配信が終わってから保存してください。"
+            wait_key
+            return 1 ;;
+    esac
+    # 状態が確認できなかったときは通常どおり進める
+    # （ダウンロード時の --match-filter でも配信中の動画は止まる）
+    return 0
+}
+
 run_download() {
     local url="$1"
     local mode="$2"
     local output_dir="$3"
+    local live_status="$4"
     local SECTION_ARGS=()
     local FORMAT_ARGS=()
     local OUTPUT_TMPL="%(title).${TITLE_MAX_BYTES}B.%(ext)s"
     local DO_NORM=0
     local LABEL
+
+    # --- ライブ配信の確認（時間指定などを選ばせる前に止める） ---
+    check_not_live "$url" "$live_status" || return 0
 
     # --- 時間指定 ---
     local RANGE_CHOICE
@@ -416,8 +459,11 @@ run_download() {
     # --print-to-file で保存先のパスを記録（完了表示とスキップ判定に使う）
     # --no-mtime でファイルの更新日時をダウンロード時刻にする（スキップ判定に使う）
     # --no-playlist でプレイリスト付き URL（watch?v=…&list=…）でも選んだ1本だけを保存する
+    # --match-filter で、ライブ配信中・配信開始前の動画は保存しない（念のための二重チェック。
+    #   「!=?」は、配信の状態が分からない動画（YouTube 以外など）は通す、という意味）
     yt-dlp -P "$output_dir" "${FORMAT_ARGS[@]}" \
         --no-playlist \
+        --match-filter "live_status!=?is_live & live_status!=?is_upcoming" \
         --embed-metadata --windows-filenames --no-mtime \
         --progress --newline \
         "${SECTION_ARGS[@]}" \
@@ -470,6 +516,7 @@ show_action_menu() {
     local url="$1"
     local target_dir="$2"
     local title="$3"
+    local live_status="$4"   # 検索結果から分かっている配信の状態（URL 指定なら空）
 
     while true; do
         local ACTION
@@ -491,9 +538,9 @@ show_action_menu() {
             "STREAM2  ストリーミング再生（シークで固まる場合）")
                 play_stream "$url" no ;;
             "VIDEO    動画保存")
-                run_download "$url" "video" "$target_dir" ;;
+                run_download "$url" "video" "$target_dir" "$live_status" ;;
             "AUDIO    音声保存")
-                run_download "$url" "audio" "$target_dir" ;;
+                run_download "$url" "audio" "$target_dir" "$live_status" ;;
             "URL      URLを確認 / コピー")
                 echo ""
                 show_status "$C_MAIN" "この動画の URL:"
@@ -538,6 +585,8 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
   AUDIO    音声保存（MP3 / M4A / BEST / WAV / FLAC）
            M4A・BEST は YouTube の音声をそのまま保存（劣化なし）
   URL      動画の URL を表示してクリップボードにコピー
+           ※ ライブ配信中・配信開始前の動画は保存できません（再生はできます）
+           ※ 検索結果では [LIVE] / [配信予定] の印が付きます
 
 保存時の設定:
   時間指定  「開始-終了」で範囲を切り出し（例: 0:00-1:00、1:20:00-1:25:30）
@@ -629,11 +678,17 @@ while true; do
         [ -z "$QUERY" ] && continue
 
         show_status "$C_MAIN" "[ 検索中... ]"
-        # 表示用テキストと動画IDをタブで区切って1行にまとめる
+        # 「表示用テキスト<TAB>動画ID<TAB>配信の状態」を1行にまとめる
         # （同名タイトルが複数あっても、IDが行ごとに紐付くのでズレない）
+        # awk で、配信中・配信予定の動画に印を付け、再生時間が無いときの空の " []" を取る
         yt-dlp --no-colors --flat-playlist \
-            --print $'[%(uploader,channel|不明)s] %(title)s [%(duration_string|)s]\t%(id)s' \
-            "ytsearch15:$QUERY" > "$TEMP_RESULT" 2> "$TEMP_ERR"
+            --print $'[%(uploader,channel|不明)s] %(title)s [%(duration_string|)s]\t%(id)s\t%(live_status|)s' \
+            "ytsearch15:$QUERY" 2> "$TEMP_ERR" \
+            | awk -F'\t' 'BEGIN { OFS = "\t" }
+                { sub(/ \[\]$/, "", $1) }
+                $3 == "is_live"     { $1 = "[LIVE] " $1 }
+                $3 == "is_upcoming" { $1 = "[配信予定] " $1 }
+                { print }' > "$TEMP_RESULT"
 
         # 「[ 検索中... ]」の行を消す（消さないと、検索するたびに画面に積み重なる）
         printf '\033[1A\r\033[2K'
@@ -673,13 +728,14 @@ while true; do
 
             VIDEO_ID=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $2}')
             DISPLAY_TITLE=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $1}')
+            LIVE_STATUS=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $3}')
             if [ -z "$VIDEO_ID" ]; then
                 show_status "$C_ERR" "動画 ID の取得に失敗しました"
                 sleep 1; continue
             fi
 
             URL="https://www.youtube.com/watch?v=$VIDEO_ID"
-            show_action_menu "$URL" "$TARGET_DIR" "$DISPLAY_TITLE"
+            show_action_menu "$URL" "$TARGET_DIR" "$DISPLAY_TITLE" "$LIVE_STATUS"
         done
     fi
 done
