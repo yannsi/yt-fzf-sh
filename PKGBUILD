@@ -4,11 +4,11 @@
 # （同じフォルダにある yt-fzf.sh / LICENSE / README.md をパッケージにします）
 
 pkgname=yt-fzf
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc="Search, stream and download YouTube videos from an fzf menu"
 arch=('any')
-url="https://github.com/yannsi/yt-fzf"
+url="https://github.com/yannsi/yt-fzf-sh"
 license=('MIT')
 depends=('bash' 'fzf' 'yt-dlp' 'ffmpeg')
 optdepends=(

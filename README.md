@@ -9,7 +9,7 @@
 - 動画保存（1080p / 720p はどの機器でも再生しやすい H.264 + AAC の MP4。最高画質も選択可）
 - 音声保存（MP3 / M4A / BEST / WAV / FLAC。M4A と BEST は YouTube の音声を変換せずそのまま保存）
 - 時間指定ダウンロード（`開始-終了` で範囲を切り出し）
-- 音量正規化（ラウドネスを統一、EBU R128 系の `loudnorm` フィルタ。形式・音質・サンプルレートは元のまま）
+- 音量正規化（ラウドネスを統一、EBU R128 系の `loudnorm` フィルタ。形式は元のまま）
 - 完了時に保存したファイルのパスを表示。同名ファイルがあってスキップされた場合はそのことを表示
 - 動画の URL 確認・クリップボードへの自動コピー
 - 保存先フォルダの選択・記憶（次回起動時も同じ場所を使用）
@@ -42,8 +42,8 @@ URL 確認機能で自動コピーを使う場合、以下のいずれかがあ�
 
 ```bash
 sudo pacman -S --needed git base-devel
-git clone https://github.com/yannsi/yt-fzf.git
-cd yt-fzf
+git clone https://github.com/yannsi/yt-fzf-sh.git
+cd yt-fzf-sh
 makepkg -si
 ```
 
@@ -53,7 +53,7 @@ makepkg -si
 sudo pacman -S --needed mpv
 ```
 
-- **アップデート**：`yt-fzf` フォルダで `git pull` してから、もう一度 `makepkg -si`
+- **アップデート**：`yt-fzf-sh` フォルダで `git pull` してから、もう一度 `makepkg -si`
 - **アンインストール**：`sudo pacman -R yt-fzf`
 
 ### 方法2：自分のホームフォルダにインストール（sudo 不要）
@@ -62,12 +62,12 @@ sudo pacman -S --needed mpv
 
 ```bash
 sudo pacman -S --needed git fzf yt-dlp ffmpeg mpv
-git clone https://github.com/yannsi/yt-fzf.git
-cd yt-fzf
+git clone https://github.com/yannsi/yt-fzf-sh.git
+cd yt-fzf-sh
 bash install.sh
 ```
 
-- **アップデート**：`yt-fzf` フォルダで `git pull` してから、もう一度 `bash install.sh`
+- **アップデート**：`yt-fzf-sh` フォルダで `git pull` してから、もう一度 `bash install.sh`
 - **アンインストール**：`bash install.sh uninstall`
 
 `yt-fzf: command not found` になる場合は `~/.local/bin` が `PATH` に入っていません。`~/.bashrc` に次の1行を追加して、ターミナルを開き直してください。
@@ -79,8 +79,8 @@ export PATH="$HOME/.local/bin:$PATH"
 ### インストールせずに試す
 
 ```bash
-git clone https://github.com/yannsi/yt-fzf.git
-cd yt-fzf
+git clone https://github.com/yannsi/yt-fzf-sh.git
+cd yt-fzf-sh
 bash yt-fzf.sh
 ```
 
@@ -127,7 +127,7 @@ EXIT     終了
 ```
 
 - **SEARCH**：キーワードを入力すると YouTube 検索結果（上位15件）が一覧表示されます。動画を選ぶと操作メニューに進みます。検索自体が失敗した場合は、エラー内容が表示されます。
-- **URL**：YouTube の URL を直接貼り付けて操作メニューに進みます。
+- **URL**：YouTube の URL を直接貼り付けて操作メニューに進みます。プレイリスト再生中の URL（`watch?v=…&list=…`）を貼っても、再生・保存されるのはその動画1本だけです（プレイリスト全体はダウンロードしません）。
 - **CONFIG**：保存先フォルダを専用のフォルダブラウザで選択します（スペースを含むフォルダ名にも対応）。選んだ場所は `~/.yt-downloader/.last_dir` に保存され、次回起動時も引き継がれます。
 
 動画を選ぶと、以下の操作メニューが表示されます。
@@ -153,7 +153,7 @@ EXIT     終了
      - 範囲指定した場合、ファイル名に時間範囲が自動的に付与されます（例: `タイトル [0-00_1-00].mp3`）。全体版や他の切り抜きと名前が衝突してスキップされるのを防ぐためです。
 2. **音量を正規化するか選択**
    - `YES` を選ぶと、`ffmpeg` の `loudnorm` フィルタ（目標 -16 LUFS）で音量をそろえます
-   - MP3 / WAV / FLAC は、形式を変換するときに同時に正規化します（変換は1回だけ）
+   - MP3 / WAV / FLAC は、形式を変換するときに同時に正規化します（変換は1回だけ）。サンプルレートは 48kHz になります
    - M4A / BEST / 動画は、ダウンロード後に音声だけを再エンコードして正規化します。音質は AAC が 192kbps、Opus が 160kbps です。形式（拡張子）とサンプルレートは元のまま保たれます
    - 動画は映像を再エンコードしないため、画質の劣化はありません
    - 正規化に失敗した場合は、ダウンロードしたファイルがそのまま残ります
@@ -211,6 +211,8 @@ EXIT     終了
 |---|---|
 | 全体ダウンロード | `タイトル.拡張子` |
 | 範囲指定ダウンロード | `タイトル [開始_終了].拡張子`（`:` は `-` に置換） |
+
+Linux のファイル名は 255 バイトまでで、日本語は1文字3バイトです。そのため、タイトルが長い場合はファイル名に使う部分を自動で切り詰めます（全体ダウンロードは 200 バイト＝日本語で約66文字、範囲指定は 180 バイト＝約60文字まで）。文字の途中で切れることはありません。
 
 同じ動画・同じ範囲を再度ダウンロードすると、yt-dlp の仕様上「同名ファイルが既に存在する」として新規作成がスキップされ、その旨が表示されます。作り直したい場合は、既存ファイルを削除・リネームしてから実行してください。
 

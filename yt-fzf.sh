@@ -48,6 +48,13 @@ FZF_OPTS=(
 # 音量正規化の目標値（EBU R128 系。-16 LUFS はスマホ・PC での視聴向け）
 LOUDNORM_FILTER="loudnorm=I=-16:TP=-1.5:LRA=11"
 
+# ファイル名に使うタイトルの最大バイト数。
+# Linux のファイル名は 255 バイトまで。日本語は1文字3バイトなので、
+# 長いタイトルだと 85 文字前後で「File name too long」になる。
+# 時間範囲・拡張子・作業用の一時名（.part など）が付く分の余裕を残して切り詰める。
+TITLE_MAX_BYTES=200        # 全体ダウンロード
+TITLE_MAX_BYTES_RANGE=180  # 範囲指定（ファイル名に時間範囲が付く分を差し引く）
+
 # --- 関数定義 ---
 
 check_dependency() {
@@ -179,6 +186,8 @@ prompt_range_input() {
 }
 
 # フォルダのみを選択する独自ブラウザ
+# ※ $( ) の中(サブシェル)で呼ばれるため、ここで exit してもツール全体は終了しない。
+#    EXIT が選ばれたら目印 "__EXIT__" を返し、呼び出し側で終了する。
 select_directory() {
     local current_dir="$1"
     local temp_dir="$current_dir"
@@ -208,7 +217,7 @@ select_directory() {
             "UP       .. (上の階層へ)")
                 temp_dir=$(realpath "$temp_dir/..") ;;
             "EXIT     終了")
-                do_exit ;;
+                echo "__EXIT__"; return ;;
             "")
                 echo "$current_dir"; return ;;
             *)
@@ -268,7 +277,7 @@ play_stream() {
         "${cache_args[@]}" \
         --network-timeout=10 \
         --script-opts="ytdl_hook-ytdl_path=$(command -v yt-dlp)" \
-        --ytdl-raw-options="force-ipv4=" \
+        --ytdl-raw-options="force-ipv4=,no-playlist=" \
         "$url" > /dev/null 2>&1
 }
 
@@ -278,7 +287,7 @@ run_download() {
     local output_dir="$3"
     local SECTION_ARGS=()
     local FORMAT_ARGS=()
-    local OUTPUT_TMPL="%(title)s.%(ext)s"
+    local OUTPUT_TMPL="%(title).${TITLE_MAX_BYTES}B.%(ext)s"
     local DO_NORM=0
     local LABEL
 
@@ -307,7 +316,7 @@ run_download() {
         # 範囲指定時はファイル名に時間範囲を含める。
         # （全体版や他の切り抜きと名前が衝突して「ダウンロード済み」でスキップされるのを防ぐ）
         # ファイル名に使えない ":" は "-" に置換する。
-        OUTPUT_TMPL="%(title)s [${START_TIME//:/-}_${END_TIME//:/-}].%(ext)s"
+        OUTPUT_TMPL="%(title).${TITLE_MAX_BYTES_RANGE}B [${START_TIME//:/-}_${END_TIME//:/-}].%(ext)s"
     fi
 
     # --- 音量正規化 ---
@@ -386,7 +395,9 @@ run_download() {
     touch "$TEMP_MARKER"
     # --print-to-file で保存先のパスを記録（完了表示とスキップ判定に使う）
     # --no-mtime でファイルの更新日時をダウンロード時刻にする（スキップ判定に使う）
+    # --no-playlist でプレイリスト付き URL（watch?v=…&list=…）でも選んだ1本だけを保存する
     yt-dlp -P "$output_dir" "${FORMAT_ARGS[@]}" \
+        --no-playlist \
         --embed-metadata --windows-filenames --no-mtime \
         --progress --newline \
         "${SECTION_ARGS[@]}" \
@@ -555,8 +566,13 @@ while true; do
     [ -z "$MODE" ] || [ "$MODE" == "EXIT     終了" ] && do_exit
 
     if [ "$MODE" == "CONFIG   保存先を変更" ]; then
-        TARGET_DIR=$(select_directory "$TARGET_DIR")
-        echo "$TARGET_DIR" > "$LAST_DIR_FILE"
+        NEW_DIR=$(select_directory "$TARGET_DIR")
+        [ "$NEW_DIR" == "__EXIT__" ] && do_exit
+        # 念のため、実在するフォルダのときだけ保存先を更新・記録する
+        if [ -d "$NEW_DIR" ]; then
+            TARGET_DIR="$NEW_DIR"
+            echo "$TARGET_DIR" > "$LAST_DIR_FILE"
+        fi
         continue
     fi
 
