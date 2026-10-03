@@ -4,7 +4,7 @@
 # （同じフォルダにある yt-fzf.sh / LICENSE / README.md をパッケージにします）
 
 pkgname=yt-fzf
-pkgver=1.0.3
+pkgver=1.0.4
 pkgrel=1
 pkgdesc="Search, stream and download YouTube videos from an fzf menu"
 arch=('any')
@@ -25,6 +25,11 @@ source=('yt-fzf.sh' 'LICENSE' 'README.md')
 sha256sums=('SKIP' 'SKIP' 'SKIP')
 
 package() {
+    # スクリプト内の VERSION と pkgver がずれていたら止める（画面の表示と版が合わなくなるため）
+    if ! grep -q "^VERSION=\"${pkgver}\"" "$srcdir/yt-fzf.sh"; then
+        echo "yt-fzf.sh の VERSION が pkgver (${pkgver}) と一致しません" >&2
+        return 1
+    fi
     install -Dm755 "$srcdir/yt-fzf.sh" "$pkgdir/usr/bin/yt-fzf"
     install -Dm644 "$srcdir/LICENSE"   "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"

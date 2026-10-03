@@ -7,6 +7,9 @@
 # ライセンス全文は同梱の LICENSE を参照してください。
 
 # --- 設定 ---
+# バージョン（PKGBUILD の pkgver と同じ値にする）
+VERSION="1.0.4"
+
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
 DEFAULT_DIR="${HOME}/Downloads"
@@ -33,7 +36,7 @@ FZF_OPTS=(
     --cycle
     --layout=reverse
     --border=double
-    --border-label=" [ YT-DOWNLOADER ] "
+    --border-label=" [ YT-DOWNLOADER v${VERSION} ] "
     --border-label-pos=top
     --color="fg+:#00ffff,bg+:#1a1a2e,hl:#af5fff"
     --color="border:#00ffff,label:#00ffff,header:#af5fff"
@@ -511,13 +514,16 @@ show_help() {
     local name
     name=$(basename "$0")
     cat <<EOF
+yt-fzf v${VERSION}
+
 使い方: ${name} [オプション]
 
 fzf のメニューで YouTube 動画を検索・再生・保存するツールです。
 オプションなしで起動するとメニューが開きます。
 
 オプション:
-  -h, --help    このヘルプを表示して終了
+  -h, --help       このヘルプを表示して終了
+  -v, --version    バージョンと本体の場所を表示して終了
 
 メインメニュー:
   SEARCH   キーワードで検索（上位15件）
@@ -560,6 +566,11 @@ case "$1" in
     "") ;;
     -h|--help)
         show_help
+        exit 0 ;;
+    -v|--version)
+        # 本体の場所も出す（古いものが別の場所にあって優先されていないか確認できるように）
+        echo "yt-fzf v${VERSION}"
+        echo "本体の場所: $(realpath "$0" 2>/dev/null || echo "$0")"
         exit 0 ;;
     *)
         echo "不明なオプション: $1" >&2
