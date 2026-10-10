@@ -8,7 +8,7 @@
 
 # --- 設定 ---
 # バージョン（PKGBUILD の pkgver と同じ値にする）
-VERSION="1.0.5"
+VERSION="1.0.6"
 
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
@@ -106,6 +106,10 @@ show_status() {
 wait_key() {
     echo "キーを押すとメニューに戻ります..."
     read -rsn 1
+    # 矢印キーなどは1回押すと複数の文字（例: ↓ = ESC [ B）が届く。
+    # 1文字目しか読んでいないので、残りが次のメニューの検索欄に入力されて
+    # メニューが空に見えてしまう。残っている入力はここで読み捨てる。
+    while read -rsn 1 -t 0.05; do :; done
     # 結果表示やエラーが次のメニューの上に残り続けないよう、画面を消してから戻る
     clear
 }
@@ -124,6 +128,18 @@ copy_to_clipboard() {
         printf '%s' "$text" | pbcopy && return 0
     fi
     return 1
+}
+
+# 動画1本ではなく、プレイリストやチャンネル全体を指す URL かどうかを判定する。
+# （--no-playlist は「動画＋プレイリスト」の URL にしか効かず、
+#   playlist?list=… やチャンネルの URL だと全動画をダウンロードしてしまうため）
+# 全体を指す URL なら 0、動画1本（または判断できない）なら 1 を返す。
+is_collection_url() {
+    local url="$1"
+    # watch?v=… / youtu.be/… / shorts/… / live/… / embed/… は動画1本
+    # （&list= が付いていても、保存されるのはその1本だけ）
+    [[ "$url" =~ ([?\&]v=|youtu\.be/|/shorts/|/live/|/embed/) ]] && return 1
+    [[ "$url" =~ ([?\&]list=|/playlist|/@|/channel/|/c/|/user/) ]]
 }
 
 # 時間(秒 / 分:秒 / 時:分:秒)が正しい形式かどうかを判定
@@ -318,7 +334,7 @@ check_not_live() {
     # （--ignore-no-formats-error: 配信開始前の動画でもエラーで止まらず状態を返させる）
     if [ "$status" != "is_live" ] && [ "$status" != "is_upcoming" ]; then
         show_status "$C_MAIN" "[ ライブ配信かどうか確認中... ]"
-        status=$(yt-dlp --no-playlist --skip-download --ignore-no-formats-error \
+        status=$(yt-dlp --no-playlist --playlist-items 1 --skip-download --ignore-no-formats-error \
             --no-warnings --print "%(live_status|)s" "$url" 2>/dev/null | tail -n 1)
         printf '\033[1A\r\033[2K'   # 「確認中」の行を消す
     fi
@@ -459,10 +475,12 @@ run_download() {
     # --print-to-file で保存先のパスを記録（完了表示とスキップ判定に使う）
     # --no-mtime でファイルの更新日時をダウンロード時刻にする（スキップ判定に使う）
     # --no-playlist でプレイリスト付き URL（watch?v=…&list=…）でも選んだ1本だけを保存する
+    # --playlist-items 1 は念のための歯止め。プレイリストやチャンネルの URL が
+    #   すり抜けてきても、全動画ではなく先頭の1本だけで止める
     # --match-filter で、ライブ配信中・配信開始前の動画は保存しない（念のための二重チェック。
     #   「!=?」は、配信の状態が分からない動画（YouTube 以外など）は通す、という意味）
     yt-dlp -P "$output_dir" "${FORMAT_ARGS[@]}" \
-        --no-playlist \
+        --no-playlist --playlist-items 1 \
         --match-filter "live_status!=?is_live & live_status!=?is_upcoming" \
         --embed-metadata --windows-filenames --no-mtime \
         --progress --newline \
@@ -663,7 +681,15 @@ while true; do
             --no-sort \
             --query="" | tail -1)
         URL="${URL//[[:space:]]/}"
-        [ -n "$URL" ] && show_action_menu "$URL" "$TARGET_DIR" "URL 指定の動画"
+        [ -z "$URL" ] && continue
+        if is_collection_url "$URL"; then
+            show_status "$C_ERR" "プレイリストやチャンネルの URL には対応していません"
+            echo "  動画1本の URL（https://www.youtube.com/watch?v=… など）を入力してください。"
+            echo "  プレイリストを再生中の URL（watch?v=…&list=…）なら、その動画1本だけを扱えます。"
+            wait_key
+            continue
+        fi
+        show_action_menu "$URL" "$TARGET_DIR" "URL 指定の動画"
         continue
     fi
 
