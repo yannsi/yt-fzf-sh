@@ -8,7 +8,7 @@
 
 # --- 設定 ---
 # バージョン（PKGBUILD の pkgver と同じ値にする）
-VERSION="1.0.7"
+VERSION="1.0.8"
 
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
@@ -47,6 +47,14 @@ FZF_OPTS=(
     --margin=1
     --padding=1
 )
+
+# メニュー（項目を選ぶだけの画面）では文字の入力欄を隠す。
+# 入力欄があると、入力欄のカーソルと選択中の項目の2か所にフォーカスがあるように見えるため。
+# --no-input は fzf 0.59 以降の機能。古い fzf ではこれまでどおり入力欄を表示する。
+FZF_MENU_OPTS=()
+if fzf --no-input --version &>/dev/null; then
+    FZF_MENU_OPTS=(--no-input)
+fi
 
 # 音量正規化の目標値（EBU R128 系。-16 LUFS はスマホ・PC での視聴向け）
 LOUDNORM_FILTER="loudnorm=I=-16:TP=-1.5:LRA=11"
@@ -94,7 +102,7 @@ do_exit() {
 fzf_menu() {
     # 引数: ヘッダー文字列、続けて選択肢を渡す
     local header="$1"; shift
-    printf '%s\n' "$@" | fzf "${FZF_OPTS[@]}" \
+    printf '%s\n' "$@" | fzf "${FZF_OPTS[@]}" "${FZF_MENU_OPTS[@]}" \
         --header="$header" \
         --header-first \
         --no-sort \
