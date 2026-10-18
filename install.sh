@@ -68,6 +68,23 @@ check_dependencies() {
     fi
 }
 
+# 音楽CDへの書き込み用のツールを確認する。
+# 使う人だけが入れればよいので、無くても案内だけにする
+check_cd_tools() {
+    command -v cdrdao &>/dev/null && return
+    echo ""
+    if command -v cdrecord &>/dev/null || command -v wodim &>/dev/null; then
+        echo "音楽CDに曲名も書き込みたい場合は、cdrdao を入れてください（今のままでも曲名なしで書き込めます）:"
+    else
+        echo "音楽CDに書き込む機能を使う場合は、cdrdao を入れてください（曲名入りの CD を作れます）:"
+    fi
+    if command -v pacman &>/dev/null; then
+        echo "  sudo pacman -S cdrdao"
+    else
+        echo "  お使いのパッケージマネージャで cdrdao をインストールしてください"
+    fi
+}
+
 # ~/.local/bin が PATH に入っているか確認する
 check_path() {
     case ":${PATH}:" in
@@ -98,6 +115,7 @@ do_install() {
 
     ok "${action}しました: ${DEST}"
     check_dependencies
+    check_cd_tools
     check_path
     echo ""
     echo "起動: ${APP_NAME}　　ヘルプ: ${APP_NAME} -h"
@@ -114,7 +132,7 @@ do_uninstall() {
     fi
 
     if [ -d "$CONFIG_DIR" ]; then
-        echo "保存先の設定（${CONFIG_DIR}）は残してあります。不要なら次のコマンドで削除できます:"
+        echo "保存先や設定ファイル（${CONFIG_DIR}）は残してあります。不要なら次のコマンドで削除できます:"
         echo "  rm -r \"${CONFIG_DIR}\""
     fi
 }

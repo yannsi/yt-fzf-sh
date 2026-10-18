@@ -8,7 +8,7 @@
 
 # --- 設定 ---
 # バージョン（PKGBUILD の pkgver と同じ値にする）
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
@@ -66,15 +66,68 @@ LOUDNORM_FILTER="loudnorm=I=-16:TP=-1.5:LRA=11"
 TITLE_MAX_BYTES=200        # 全体ダウンロード
 TITLE_MAX_BYTES_RANGE=180  # 範囲指定（ファイル名に時間範囲が付く分を差し引く）
 
-# ストリーミング再生で取得する画質（yt-dlp の -f と同じ書き方）。
-# 重いときは height<=720 などに下げる。音声だけで再生したいときは 'ba' にする。
-STREAM_FORMAT='bv*[height<=1080]+ba/b'
-
 # 手元のファイル（LOCAL）の一覧に出す、音声・動画ファイルの拡張子
 LOCAL_EXTS="mp3|m4a|aac|opus|ogg|oga|wav|flac|wma|webm|mp4|mkv|mov|m4v|avi"
 
+# --- 好みで変えられる設定（~/.yt-downloader/config に書くと、こちらより優先される） ---
+# ストリーミング再生（STREAM）で取得する画質（yt-dlp の -f と同じ書き方）
+STREAM_FORMAT='bv*[height<=1080]+ba/b'
+# 音声のみ再生（LISTEN）で取得する形式
+LISTEN_FORMAT='ba/b'
+# 検索結果の件数
+SEARCH_COUNT=15
 # 音楽CDに入る時間の上限（秒）。一般的な 80 分の CD-R は 4800 秒（74 分の CD-R は 4440 秒）
 CD_MAX_SECONDS=4800
+
+# 設定ファイル。パッケージで入れた本体（/usr/bin/yt-fzf）は更新のたびに上書きされるため、
+# 好みの設定は本体ではなくこのファイルに書く。無ければ説明付きのひな形を作る。
+CONFIG_FILE="${CONFIG_DIR}/config"
+if [ ! -f "$CONFIG_FILE" ]; then
+    cat > "$CONFIG_FILE" 2>/dev/null <<'CONF'
+# yt-fzf の設定ファイル
+# 変えたい行の先頭の「#」を消して、値を書き換えてください。
+# 書いていない項目は、標準の値が使われます。
+
+# ストリーミング再生（STREAM）の画質。720p までにするなら height<=720
+#STREAM_FORMAT='bv*[height<=1080]+ba/b'
+
+# 音声のみ再生（LISTEN）の形式
+#LISTEN_FORMAT='ba/b'
+
+# 検索結果の件数（1〜50）
+#SEARCH_COUNT=15
+
+# 音楽CDに入る時間の上限（秒）。80 分の CD-R は 4800、74 分の CD-R は 4440
+#CD_MAX_SECONDS=4800
+CONF
+fi
+
+# 設定ファイルを読み込む。
+# source で実行はせず、決まった項目の「名前=値」だけを読む（書き間違いで本体が壊れないように）
+load_config() {
+    [ -f "$CONFIG_FILE" ] || return
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value%"${value##*[![:space:]]}"}"   # 末尾の空白を除く
+        if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+        case "$key" in
+            STREAM_FORMAT|LISTEN_FORMAT)
+                [ -n "$value" ] && printf -v "$key" '%s' "$value" ;;
+            SEARCH_COUNT)
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 50 )) && SEARCH_COUNT="$value" ;;
+            CD_MAX_SECONDS)
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value > 0 )) && CD_MAX_SECONDS="$value" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+load_config
 
 # --- 関数定義 ---
 
@@ -269,49 +322,52 @@ select_directory() {
 }
 
 # 保存済みファイルの音量を正規化して上書きする。
-# 拡張子に合った形式・音質で再エンコードし、サンプルレートも元のまま保つ。
+# 処理は手元のファイルの加工（LOCAL）と共通（形式・サンプルレートは元のまま、映像はそのまま）
 normalize_file() {
-    local file="$1" mode="$2"
-    local ext="${file##*.}"
-    local tmp="${file%.*}.norm-tmp.${ext}"
-    local rate codec_args=() video_args=(-vn)
+    convert_local_file "$1" "$1" same "" "" "$LOUDNORM_FILTER"
+}
 
-    # loudnorm は既定で 192kHz に変換してしまうため、元のサンプルレートを指定し直す
-    rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$file" 2>/dev/null)
-    [[ "$rate" =~ ^[0-9]+$ ]] || rate=48000
-
-    case "${ext,,}" in
-        mp3)           codec_args=(-c:a libmp3lame -q:a 0) ;;
-        m4a|mp4|aac)   codec_args=(-c:a aac -b:a 192k) ;;
-        opus|webm|ogg) codec_args=(-c:a libopus -b:a 160k); rate=48000 ;;  # Opus は 48kHz 固定
-        flac)          codec_args=(-c:a flac) ;;
-        wav)           codec_args=(-c:a pcm_s16le) ;;
-    esac
-    [ "$mode" == "video" ] && video_args=(-c:v copy)   # 映像は再エンコードしない
-
-    if ffmpeg -hide_banner -loglevel error -y -i "$file" -map_metadata 0 \
-            "${video_args[@]}" -af "$LOUDNORM_FILTER" -ar "$rate" "${codec_args[@]}" "$tmp"; then
-        mv -f "$tmp" "$file"
+# yt-dlp を更新するコマンド。
+# pacman で入れた yt-dlp は「yt-dlp -U」で更新できないため、入れ方に合わせて案内する
+ytdlp_update_cmd() {
+    local bin
+    bin=$(command -v yt-dlp)
+    if [ -n "$bin" ] && command -v pacman &>/dev/null && pacman -Qqo "$bin" &>/dev/null; then
+        echo "sudo pacman -Syu yt-dlp"
     else
-        rm -f "$tmp"
-        return 1
+        echo "yt-dlp -U"
     fi
 }
 
+# mpv の終了コードを見て、失敗していればログからエラーを表示する。
+# 0 = 普通に終了（Q / ウィンドウを閉じる）、4 = Ctrl+C など。それ以外は再生に失敗している
+_report_play_result() {
+    local rc="$1" hint="$2"
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 4 ]; then
+        show_status "$C_ERR" "再生できませんでした"
+        grep -iE "error|failed|unable" "$TEMP_PLAYLOG" | tail -n 3 | sed 's/^/  /'
+        [ -n "$hint" ] && echo "$hint"
+        wait_key
+    fi
+}
+
+# mpv が無ければ案内して 1 を返す
+_need_mpv() {
+    command -v mpv &>/dev/null && return 0
+    show_status "$C_ERR" "再生には mpv が必要です。パッケージマネージャでインストールしてください。"
+    wait_key
+    return 1
+}
+
 # yt-dlp で取得しながら mpv でストリーミング再生する。
-# $2 = yes: キャッシュを大きく取る（通常） / no: キャッシュ無効（シークで固まる場合）
+# $2 = video: 動画で再生 / audio: 音声のみで再生（通信量が少ない）
 # $3 = ウィンドウに表示するタイトル（省略時は URL）
 play_stream() {
-    local url="$1" cache="$2" title="${3:-$1}"
-    local cache_args=(--cache=no)
+    local url="$1" mode="$2" title="${3:-$1}"
+    local format="$STREAM_FORMAT"
+    [ "$mode" == "audio" ] && format="$LISTEN_FORMAT"
 
-    if ! command -v mpv &>/dev/null; then
-        show_status "$C_ERR" "再生には mpv が必要です。パッケージマネージャでインストールしてください。"
-        wait_key
-        return
-    fi
-
-    [ "$cache" == "yes" ] && cache_args=(--cache=yes --demuxer-max-bytes=500MiB --demuxer-max-back-bytes=150MiB)
+    _need_mpv || return
 
     show_status "$C_MAIN" "再生中... （Q キーで終了）"
 
@@ -321,12 +377,12 @@ play_stream() {
     # mkv で結合して流す（mp4 は途中から読めないのでパイプでは再生できない）
     : > "$TEMP_PLAYLOG"
     yt-dlp -q --no-warnings --no-playlist --socket-timeout 10 \
-        -f "$STREAM_FORMAT" --merge-output-format mkv \
+        -f "$format" --merge-output-format mkv \
         -o - "$url" 2>> "$TEMP_PLAYLOG" \
     | mpv \
         --geometry=50% \
         --force-window \
-        "${cache_args[@]}" \
+        --cache=yes --demuxer-max-bytes=500MiB --demuxer-max-back-bytes=150MiB \
         --title="$title" \
         - >> "$TEMP_PLAYLOG" 2>&1
     # mpv の終了コードで判定する
@@ -337,15 +393,18 @@ play_stream() {
     # \033[1A = 1行上へ、\r = 行頭へ、\033[2K = その行を消去
     printf '\033[1A\r\033[2K'
 
-    # mpv の終了コード: 0 = 普通に終了（Q / ウィンドウを閉じる）、4 = Ctrl+C など
-    # それ以外は再生に失敗しているので、理由がわかるようにエラーを表示する
-    # （yt-dlp が取得に失敗した場合も、mpv は何も受け取れずに失敗で終わる）
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 4 ]; then
-        show_status "$C_ERR" "再生できませんでした"
-        grep -iE "error|failed|unable" "$TEMP_PLAYLOG" | tail -n 3 | sed 's/^/  /'
-        echo "URL を確認してください。yt-dlp -U で更新すると直ることがあります。"
-        wait_key
-    fi
+    # yt-dlp が取得に失敗した場合も、mpv は何も受け取れずに失敗で終わる
+    _report_play_result "$rc" "URL を確認してください。$(ytdlp_update_cmd) で yt-dlp を更新すると直ることがあります。"
+}
+
+# 手元のファイルを mpv で再生する（複数なら続けて再生）
+play_local() {
+    _need_mpv || return
+    show_status "$C_MAIN" "再生中... （Q キーで終了、> / < で次 / 前のファイル）"
+    mpv --geometry=50% --force-window --keep-open=no "$@" > "$TEMP_PLAYLOG" 2>&1
+    local rc=$?
+    printf '\033[1A\r\033[2K'
+    _report_play_result "$rc" ""
 }
 
 # ライブ配信中・配信開始前の動画は保存しない。
@@ -387,46 +446,44 @@ check_not_live() {
     return 0
 }
 
-run_download() {
-    local url="$1"
-    local mode="$2"
-    local output_dir="$3"
-    local live_status="$4"
-    local SECTION_ARGS=()
-    local FORMAT_ARGS=()
-    local OUTPUT_TMPL="%(title).${TITLE_MAX_BYTES}B.%(ext)s"
-    local DO_NORM=0
-    local LABEL
+# 保存の設定（時間指定・音量正規化・画質 / 音声形式）をメニューで聞き、DL_* に入れる。
+#   $1 = video / audio
+#   $2 = yes なら時間指定も聞く（まとめて保存するときは聞かない）
+# 戻る を選んだら 1 を返す。
+ask_download_options() {
+    local mode="$1" allow_range="$2"
+    DL_SECTION_ARGS=()
+    DL_FORMAT_ARGS=()
+    DL_OUTPUT_TMPL="%(title).${TITLE_MAX_BYTES}B.%(ext)s"
+    DL_DO_NORM=0
+    DL_LABEL=""
 
-    # --- ライブ配信の確認（時間指定などを選ばせる前に止める） ---
-    check_not_live "$url" "$live_status" || return 0
-
-    # --- 時間指定 ---
-    local RANGE_CHOICE
-    RANGE_CHOICE=$(fzf_menu "時間指定でダウンロードしますか？" \
+    # --- 時間指定（1本だけ保存するとき） ---
+    local RANGE_CHOICE="FULL     全体をダウンロード"
+    [ "$allow_range" == "yes" ] && RANGE_CHOICE=$(fzf_menu "時間指定でダウンロードしますか？" \
         "FULL     全体をダウンロード" \
         "RANGE    範囲を指定する" \
         "BACK     戻る" \
         "EXIT     終了")
     [ "$RANGE_CHOICE" == "EXIT     終了" ] && do_exit
-    if [ -z "$RANGE_CHOICE" ] || [ "$RANGE_CHOICE" == "BACK     戻る" ]; then return 0; fi
+    if [ -z "$RANGE_CHOICE" ] || [ "$RANGE_CHOICE" == "BACK     戻る" ]; then return 1; fi
 
     if [ "$RANGE_CHOICE" == "RANGE    範囲を指定する" ]; then
         local RANGE_RESULT START_TIME END_TIME
         RANGE_RESULT=$(prompt_range_input)
-        if [ -z "$RANGE_RESULT" ]; then return 0; fi
+        if [ -z "$RANGE_RESULT" ]; then return 1; fi
 
         START_TIME="${RANGE_RESULT%-*}"
         END_TIME="${RANGE_RESULT##*-}"
-        SECTION_ARGS=(--download-sections "*${START_TIME}-${END_TIME}")
+        DL_SECTION_ARGS=(--download-sections "*${START_TIME}-${END_TIME}")
         # --force-keyframes-at-cuts は映像のカットをきれいにするための再エンコード指定。
         # 音声抽出(-x)では不要で、付けるとファイルが生成されないことがあるため動画時のみ付与。
-        [ "$mode" == "video" ] && SECTION_ARGS+=(--force-keyframes-at-cuts)
+        [ "$mode" == "video" ] && DL_SECTION_ARGS+=(--force-keyframes-at-cuts)
 
         # 範囲指定時はファイル名に時間範囲を含める。
         # （全体版や他の切り抜きと名前が衝突して「ダウンロード済み」でスキップされるのを防ぐ）
         # ファイル名に使えない ":" は "-" に置換する。
-        OUTPUT_TMPL="%(title).${TITLE_MAX_BYTES_RANGE}B [${START_TIME//:/-}_${END_TIME//:/-}].%(ext)s"
+        DL_OUTPUT_TMPL="%(title).${TITLE_MAX_BYTES_RANGE}B [${START_TIME//:/-}_${END_TIME//:/-}].%(ext)s"
     fi
 
     # --- 音量正規化 ---
@@ -437,8 +494,8 @@ run_download() {
         "BACK     戻る" \
         "EXIT     終了")
     [ "$NORM_CHOICE" == "EXIT     終了" ] && do_exit
-    if [ -z "$NORM_CHOICE" ] || [ "$NORM_CHOICE" == "BACK     戻る" ]; then return 0; fi
-    [ "$NORM_CHOICE" == "YES      正規化する" ] && DO_NORM=1
+    if [ -z "$NORM_CHOICE" ] || [ "$NORM_CHOICE" == "BACK     戻る" ]; then return 1; fi
+    [ "$NORM_CHOICE" == "YES      正規化する" ] && DL_DO_NORM=1
 
     # --- 画質 / 音声フォーマット ---
     if [ "$mode" == "video" ]; then
@@ -450,7 +507,7 @@ run_download() {
             "BACK     戻る" \
             "EXIT     終了")
         [ "$QUALITY" == "EXIT     終了" ] && do_exit
-        if [ -z "$QUALITY" ] || [ "$QUALITY" == "BACK     戻る" ]; then return 0; fi
+        if [ -z "$QUALITY" ] || [ "$QUALITY" == "BACK     戻る" ]; then return 1; fi
 
         # 1080p/720p は H.264 + AAC を優先（どの機器でも再生しやすい MP4 にする）
         case "$QUALITY" in
@@ -458,8 +515,8 @@ run_download() {
             "720p / MP4")  SORT="res:720,vcodec:h264,acodec:m4a" ;;
             *)             SORT="res,fps,vcodec,acodec" ;;
         esac
-        FORMAT_ARGS=(-S "$SORT" --merge-output-format mp4)
-        LABEL="[ ダウンロード中 ]"
+        DL_FORMAT_ARGS=(-S "$SORT" --merge-output-format mp4)
+        DL_LABEL="[ ダウンロード中 ]"
     else
         local AUDIO_FMT FMT NOTE=""
         AUDIO_FMT=$(fzf_menu "音声フォーマットを選択" \
@@ -471,7 +528,7 @@ run_download() {
             "BACK     戻る" \
             "EXIT     終了")
         [ "$AUDIO_FMT" == "EXIT     終了" ] && do_exit
-        if [ -z "$AUDIO_FMT" ] || [ "$AUDIO_FMT" == "BACK     戻る" ]; then return 0; fi
+        if [ -z "$AUDIO_FMT" ] || [ "$AUDIO_FMT" == "BACK     戻る" ]; then return 1; fi
 
         # 先頭の単語（MP3 / M4A / ...）で判定する
         case "${AUDIO_FMT%% *}" in
@@ -481,24 +538,32 @@ run_download() {
             WAV)  FMT="wav"  ;;
             FLAC) FMT="flac" ;;
         esac
-        FORMAT_ARGS=(-x --audio-format "$FMT" --audio-quality 0)
+        DL_FORMAT_ARGS=(-x --audio-format "$FMT" --audio-quality 0)
 
         # M4A は YouTube にある AAC 音声をそのまま使う（Opus を取ってきて AAC に変換し直さない）
-        [ "$FMT" == "m4a" ] && FORMAT_ARGS+=(-S "acodec:m4a")
+        [ "$FMT" == "m4a" ] && DL_FORMAT_ARGS+=(-S "acodec:m4a")
 
         # MP3 / WAV / FLAC は必ず変換が入るので、その変換の中で音量正規化も行う。
         # （変換 → 正規化 と2回に分けると、時間がかかり MP3 は劣化も重なるため）
-        if [ "$DO_NORM" -eq 1 ] && [[ "$FMT" =~ ^(mp3|wav|flac)$ ]]; then
-            FORMAT_ARGS+=(--postprocessor-args "ExtractAudio:-af $LOUDNORM_FILTER -ar 48000")
-            DO_NORM=0   # 変換時に済ませたので、後からの正規化は行わない
+        if [ "$DL_DO_NORM" -eq 1 ] && [[ "$FMT" =~ ^(mp3|wav|flac)$ ]]; then
+            DL_FORMAT_ARGS+=(--postprocessor-args "ExtractAudio:-af $LOUDNORM_FILTER -ar 48000")
+            DL_DO_NORM=0   # 変換時に済ませたので、後からの正規化は行わない
             NOTE="・音量正規化あり"
         fi
-        LABEL="[ 音声を抽出中: ${FMT}${NOTE} ]"
+        DL_LABEL="[ 音声を抽出中: ${FMT}${NOTE} ]"
     fi
+    return 0
+}
+
+# ask_download_options で決めた設定で1本ダウンロードし、結果を表示する。
+#   $1 = URL / $2 = video / audio / $3 = 保存先フォルダ / $4 = yes なら最後にキー入力を待つ
+# 保存できたら 0、失敗・スキップなら 1 を返す。
+do_download() {
+    local url="$1" mode="$2" output_dir="$3" wait="$4"
 
     # --- ダウンロード実行 ---
     echo ""
-    show_status "$C_MAIN" "$LABEL  完了まで画面をそのままにしてください"
+    show_status "$C_MAIN" "$DL_LABEL  完了まで画面をそのままにしてください"
     echo ""
 
     : > "$TEMP_PATHS"
@@ -510,22 +575,22 @@ run_download() {
     #   すり抜けてきても、全動画ではなく先頭の1本だけで止める
     # --match-filter で、ライブ配信中・配信開始前の動画は保存しない（念のための二重チェック。
     #   「!=?」は、配信の状態が分からない動画（YouTube 以外など）は通す、という意味）
-    yt-dlp -P "$output_dir" "${FORMAT_ARGS[@]}" \
+    yt-dlp -P "$output_dir" "${DL_FORMAT_ARGS[@]}" \
         --no-playlist --playlist-items 1 \
         --match-filter "live_status!=?is_live & live_status!=?is_upcoming" \
         --embed-metadata --windows-filenames --no-mtime \
         --progress --newline \
-        "${SECTION_ARGS[@]}" \
+        "${DL_SECTION_ARGS[@]}" \
         --print-to-file after_move:filepath "$TEMP_PATHS" \
-        -o "$OUTPUT_TMPL" "$url"
+        -o "$DL_OUTPUT_TMPL" "$url"
     local exit_code=$?
     echo ""
 
     if [ "$exit_code" -ne 0 ]; then
         show_status "$C_ERR" "ダウンロードに失敗しました"
-        echo "上記のエラーメッセージを確認してください（yt-dlp -U で更新すると直ることがあります）。"
-        wait_key
-        return 0
+        echo "上記のエラーメッセージを確認してください（$(ytdlp_update_cmd) で yt-dlp を更新すると直ることがあります）。"
+        [ "$wait" == "yes" ] && wait_key
+        return 1
     fi
 
     local saved
@@ -533,8 +598,8 @@ run_download() {
     if [ -z "$saved" ] || [ ! -f "$saved" ]; then
         show_status "$C_ERR" "保存されたファイルを確認できませんでした"
         echo "  保存先フォルダ: $output_dir"
-        wait_key
-        return 0
+        [ "$wait" == "yes" ] && wait_key
+        return 1
     fi
 
     # 開始時刻より古いファイル = 今回は作られていない（同名ファイルがあってスキップされた）
@@ -542,22 +607,82 @@ run_download() {
         show_status "$C_ERR" "同じ名前のファイルが既にあるため、ダウンロードをスキップしました"
         echo "  既存ファイル: $saved"
         echo "  作り直す場合は、既存ファイルを削除するか名前を変えてから実行してください。"
-        wait_key
-        return 0
+        [ "$wait" == "yes" ] && wait_key
+        return 1
     fi
 
-    if [ "$DO_NORM" -eq 1 ]; then
+    if [ "$DL_DO_NORM" -eq 1 ]; then
         show_status "$C_MAIN" "[ 音量を正規化中 ]"
-        if ! normalize_file "$saved" "$mode"; then
+        if ! normalize_file "$saved"; then
             show_status "$C_ERR" "音量の正規化に失敗しました（ダウンロードしたファイルはそのまま残っています）"
             echo "  保存先: $saved"
-            wait_key
-            return 0
+            [ "$wait" == "yes" ] && wait_key
+            return 1
         fi
     fi
 
     show_status "$C_OK" "[ 完了 ]"
     echo "  保存先: $saved"
+    [ "$wait" == "yes" ] && wait_key
+    return 0
+}
+
+
+run_download() {
+    local url="$1"
+    local mode="$2"
+    local output_dir="$3"
+    local live_status="$4"
+
+    # --- ライブ配信の確認（時間指定などを選ばせる前に止める） ---
+    check_not_live "$url" "$live_status" || return 0
+
+    ask_download_options "$mode" yes || return 0
+    do_download "$url" "$mode" "$output_dir" yes
+    return 0
+}
+
+# 検索結果で複数選んだ動画をまとめて保存する。
+# 引数: 検索結果の行（「表示用テキスト<TAB>動画ID<TAB>配信の状態」）を選んだ順に
+batch_download() {
+    local -a lines=("$@")
+    local count=${#lines[@]} choice mode line title id status
+    local i ok=0 fail=0 skip=0
+
+    choice=$(fzf_menu "まとめて保存  |  ${count} 本の動画" \
+        "VIDEO    まとめて動画保存" \
+        "AUDIO    まとめて音声保存" \
+        "BACK     戻る" \
+        "EXIT     終了")
+    [ "$choice" == "EXIT     終了" ] && do_exit
+    if [ -z "$choice" ] || [ "$choice" == "BACK     戻る" ]; then return 0; fi
+    mode="video"
+    [ "${choice%% *}" == "AUDIO" ] && mode="audio"
+
+    # 設定は1回だけ聞いて、全部の動画に使う（時間指定は動画ごとに違うので聞かない）
+    ask_download_options "$mode" no || return 0
+
+    for i in "${!lines[@]}"; do
+        line="${lines[$i]}"
+        IFS=$'\t' read -r title id status <<< "$line"
+        echo ""
+        show_status "$C_MAIN" "[ $((i + 1))/${count} ] ${title}"
+        if [ "$status" == "is_live" ] || [ "$status" == "is_upcoming" ]; then
+            show_status "$C_ERR" "ライブ配信中・配信開始前の動画のため、保存しません"
+            skip=$((skip + 1))
+            continue
+        fi
+        if do_download "https://www.youtube.com/watch?v=$id" "$mode" "$TARGET_DIR" no; then
+            ok=$((ok + 1))
+        else
+            fail=$((fail + 1))
+        fi
+    done
+
+    echo ""
+    show_status "$C_OK" "[ まとめて保存 終了 ]  保存: ${ok} 本 / うまくいかなかった: ${fail} 本 / 対象外: ${skip} 本"
+    echo "  保存先: $TARGET_DIR"
+    [ "$fail" -gt 0 ] && echo "  うまくいかなかった動画は、上のメッセージを確認してください（同じ名前のファイルがある場合も含みます）。"
     wait_key
 }
 
@@ -571,7 +696,7 @@ show_action_menu() {
         local ACTION
         ACTION=$(fzf_menu "操作を選択  |  $title" \
             "STREAM   ストリーミング再生" \
-            "STREAM2  ストリーミング再生（シークで固まる場合）" \
+            "LISTEN   音声のみ再生（通信量が少ない）" \
             "VIDEO    動画保存" \
             "AUDIO    音声保存" \
             "URL      URLを確認 / コピー" \
@@ -583,9 +708,9 @@ show_action_menu() {
 
         case "$ACTION" in
             "STREAM   ストリーミング再生")
-                play_stream "$url" yes "$title" ;;
-            "STREAM2  ストリーミング再生（シークで固まる場合）")
-                play_stream "$url" no "$title" ;;
+                play_stream "$url" video "$title" ;;
+            "LISTEN   音声のみ再生（通信量が少ない）")
+                play_stream "$url" audio "$title" ;;
             "VIDEO    動画保存")
                 run_download "$url" "video" "$target_dir" "$live_status" ;;
             "AUDIO    音声保存")
@@ -756,7 +881,6 @@ convert_local_file() {
 
     [ -n "$start" ] && in_args=(-ss "$start")
     [ -n "$len" ] && other_args+=(-t "$len")
-    [ -n "$af" ] && other_args+=(-af "$af")
 
     # 元のサンプルレートを保つ（loudnorm は既定で 192kHz にしてしまうため指定し直す）
     rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$in" 2>/dev/null)
@@ -767,7 +891,10 @@ convert_local_file() {
         m4a)   map_args=(-map 0:a:0); codec_args=(-c:a aac -b:a 256k) ;;
         wav)   map_args=(-map 0:a:0); codec_args=(-c:a pcm_s16le) ;;
         flac)  map_args=(-map 0:a:0); codec_args=(-c:a flac) ;;
-        cdwav) map_args=(-map 0:a:0); codec_args=(-c:a pcm_s16le -ac 2); rate=44100 ;;  # CD の規格
+        cdwav)
+            # CD の規格（44.1kHz / 16bit / ステレオ）。4 秒未満の曲は CD に書けないので無音を足して 4 秒にする
+            map_args=(-map 0:a:0); codec_args=(-c:a pcm_s16le -ac 2); rate=44100
+            af="${af:+$af,}apad=whole_dur=4" ;;
         same)
             # 音声は拡張子に合った形式で作り直す
             case "${ext,,}" in
@@ -797,6 +924,8 @@ convert_local_file() {
             ;;
     esac
 
+    [ -n "$af" ] && other_args+=(-af "$af")
+
     if ffmpeg -nostdin -hide_banner -loglevel error -stats -y \
             "${in_args[@]}" -i "$in" -map_metadata 0 \
             "${map_args[@]}" "${other_args[@]}" "${codec_args[@]}" -ar "$rate" "$tmp"; then
@@ -807,26 +936,72 @@ convert_local_file() {
     fi
 }
 
-# 音楽CDの書き込みソフト（cdrecord / wodim）を探す
+# 音楽CDの書き込みソフトを探す。
+# cdrdao を優先する（日本語の曲名を CD-Text として書き込めるため）。無ければ cdrecord / wodim
 _find_cd_writer() {
-    if command -v cdrecord &>/dev/null; then
-        echo cdrecord
-    elif command -v wodim &>/dev/null; then
-        echo wodim
-    fi
+    local cmd
+    for cmd in cdrdao cdrecord wodim; do
+        if command -v "$cmd" &>/dev/null; then
+            echo "$cmd"
+            return
+        fi
+    done
+}
+
+# CD-Text に書く文字列を整える。
+# CD-Text の日本語は Shift_JIS（CP932）なので、そこで表せない文字（絵文字など）は除き、
+# TOC ファイルの書式を壊す " と \ は置き換え、長すぎるものは切り詰める
+_cdtext_str() {
+    local s="$1"
+    s=$(printf '%s' "$s" | iconv -c -f UTF-8 -t CP932 2>/dev/null | iconv -f CP932 -t UTF-8 2>/dev/null)
+    s="${s//\"/\'}"
+    s="${s//\\/／}"
+    s="${s//[$'\t\r\n']/ }"
+    printf '%s' "${s:0:60}"
+}
+
+# ファイルのタグ（title / artist など）を読む。無ければ空
+_tag() {
+    ffprobe -v error -show_entries "format_tags=$2" -of default=nw=1:nk=1 "$1" 2>/dev/null | head -n 1
+}
+
+# cdrdao 用の TOC ファイル（曲順・曲名などを書いた設計図）を作る。
+#   $1 TOC の保存先 / $2 アルバム名（空なら CD-Text なし） / $3 yes なら CD-Text を書く
+#   続く引数: 「WAVのパス<TAB>曲名<TAB>アーティスト」を曲順に
+_write_toc() {
+    local toc="$1" album="$2" use_text="$3"; shift 3
+    local entry wav title artist
+    {
+        echo "CD_DA"
+        if [ "$use_text" == "yes" ]; then
+            # 105 = 日本語（CD-Text の言語コード）。ENCODING_MS_JIS で Shift_JIS として書き込む
+            printf 'CD_TEXT {\n  LANGUAGE_MAP {\n    0 : 105\n  }\n  LANGUAGE 0 {\n'
+            printf '    ENCODING_MS_JIS\n    TITLE "%s"\n    PERFORMER ""\n  }\n}\n' "$(_cdtext_str "$album")"
+        fi
+        for entry in "$@"; do
+            IFS=$'\t' read -r wav title artist <<< "$entry"
+            printf '\nTRACK AUDIO\n'
+            if [ "$use_text" == "yes" ]; then
+                printf 'CD_TEXT {\n  LANGUAGE 0 {\n    TITLE "%s"\n    PERFORMER "%s"\n  }\n}\n' \
+                    "$(_cdtext_str "$title")" "$(_cdtext_str "$artist")"
+            fi
+            printf 'FILE "%s" 0\n' "$wav"
+        done
+    } > "$toc"
 }
 
 # 選んだファイルを音楽CDに書き込む。
 #   $1 開始秒 / $2 長さ秒 / $3 音声フィルタ（いずれも空なら指定なし。時間指定は1ファイルのときだけ）
 burn_audio_cd() {
     local start="$1" len="$2" af="$3"
-    local writer dev total=0 d i f choice
-    local -a devs durs
+    local writer dev total=0 d i f choice album="" out rc
+    local -a devs durs titles artists
 
     writer=$(_find_cd_writer)
     if [ -z "$writer" ]; then
-        show_status "$C_ERR" "CD の書き込みには cdrtools（cdrecord）が必要です"
-        echo "  インストール: sudo pacman -S cdrtools"
+        show_status "$C_ERR" "CD の書き込みには cdrdao（または cdrtools）が必要です"
+        echo "  インストール: sudo pacman -S cdrdao"
+        echo "  （cdrdao なら、曲名入りの CD を作れます）"
         wait_key
         return 0
     fi
@@ -847,7 +1022,7 @@ burn_audio_cd() {
         [ -z "$dev" ] && return 0
     fi
 
-    # --- 合計時間を確認する ---
+    # --- 合計時間と曲名を確認する ---
     for f in "${LOCAL_FILES[@]}"; do
         d="$len"
         [ -z "$d" ] && d=$(_duration "$f")
@@ -857,11 +1032,17 @@ burn_audio_cd() {
             wait_key
             return 0
         fi
+        (( d < 4 )) && d=4   # CD の規格で、4 秒未満の曲は無音を足して 4 秒にする
         durs+=("$d")
         total=$((total + d))
+        # 曲名はファイルのタグ（無ければファイル名）を使う
+        out=$(_tag "$f" title)
+        [ -z "$out" ] && out="$(basename "${f%.*}")"
+        titles+=("$out")
+        artists+=("$(_tag "$f" artist)")
     done
-
-    if (( total > CD_MAX_SECONDS )); then
+    # 曲間の 2 秒（1 曲目の前の空白）の分も見ておく
+    if (( total + 2 > CD_MAX_SECONDS )); then
         show_status "$C_ERR" "合計 $(_fmt_time "$total") で、CD に入る時間（$(_fmt_time "$CD_MAX_SECONDS")）を超えています"
         echo "  曲を減らすか、時間指定で短くしてください。"
         wait_key
@@ -872,10 +1053,15 @@ burn_audio_cd() {
     clear
     show_status "$C_MAIN" "[ 音楽CDに書き込む曲 ]  ドライブ: $dev"
     for i in "${!LOCAL_FILES[@]}"; do
-        printf '  %2d. %s  (%s)\n' $((i + 1)) "$(basename "${LOCAL_FILES[$i]}")" "$(_fmt_time "${durs[$i]}")"
+        printf '  %2d. %s  (%s)\n' $((i + 1)) "${titles[$i]}" "$(_fmt_time "${durs[$i]}")"
     done
     echo "  合計: $(_fmt_time "$total")（${#LOCAL_FILES[@]} 曲）"
     (( total > 4440 )) && echo "  ※ 74 分を超えているため、80 分の CD-R が必要です"
+    if [ "$writer" == "cdrdao" ]; then
+        echo "  曲名（上の名前）も CD に書き込みます（CD-Text。対応する機器で表示されます）"
+    else
+        echo "  ※ 曲名の書き込み（CD-Text）には cdrdao が必要です（sudo pacman -S cdrdao）"
+    fi
     echo ""
 
     choice=$(fzf_menu "書き込みますか？（空の CD-R を入れてから選んでください）" \
@@ -886,12 +1072,22 @@ burn_audio_cd() {
     [ "$choice" == "EXIT     終了" ] && do_exit
     if [ -z "$choice" ] || [ "$choice" == "BACK     戻る" ]; then clear; return 0; fi
 
-    # --- ディスクが入っているか確認する ---
-    if ! "$writer" dev="$dev" -atip &>/dev/null; then
-        show_status "$C_ERR" "ディスクが入っていないか、読み取れません"
-        echo "  空の CD-R を入れて、数秒待ってからやり直してください。"
-        wait_key
-        return 0
+    # --- CD のタイトル（cdrdao のときだけ） ---
+    if [ "$writer" == "cdrdao" ]; then
+        out=$(echo "" | fzf "${FZF_OPTS[@]}" \
+            --header="CD のタイトル（アルバム名）を入力して Enter。空のまま Enter ならタイトルなし（ESC で戻る）" \
+            --header-first --height=30% --print-query --no-sort --query="")
+        rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then clear; return 0; fi   # ESC
+        album=$(head -n 1 <<< "$out")
+    else
+        # cdrecord / wodim は書き込む前にディスクの有無を確かめられる
+        if ! "$writer" dev="$dev" -atip &>/dev/null; then
+            show_status "$C_ERR" "ディスクが入っていないか、読み取れません"
+            echo "  空の CD-R を入れて、数秒待ってからやり直してください。"
+            wait_key
+            return 0
+        fi
     fi
 
     # --- CD 用の WAV（44.1kHz / 16bit / ステレオ）を一時フォルダに作る ---
@@ -900,12 +1096,13 @@ burn_audio_cd() {
     local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}"
     mkdir -p "$cache_dir"
     TEMP_CD_DIR=$(mktemp -d "$cache_dir/yt-fzf-cd.XXXXXX")
-    local -a wavs
+    local -a wavs entries
     echo ""
     for i in "${!LOCAL_FILES[@]}"; do
         f="${LOCAL_FILES[$i]}"
         show_status "$C_MAIN" "[ CD 用に変換中 $((i + 1))/${#LOCAL_FILES[@]} ] $(basename "$f")"
         wavs+=("$TEMP_CD_DIR/$(printf '%02d' $((i + 1))).wav")
+        entries+=("${wavs[$i]}"$'\t'"${titles[$i]}"$'\t'"${artists[$i]}")
         if ! convert_local_file "$f" "${wavs[$i]}" cdwav "$start" "$len" "$af"; then
             show_status "$C_ERR" "変換に失敗しました: $(basename "$f")"
             rm -rf "$TEMP_CD_DIR"; TEMP_CD_DIR=""
@@ -914,31 +1111,55 @@ burn_audio_cd() {
         fi
     done
 
-    # --- 書き込む ---
-    # -dao: 曲間に余計な無音を入れずに一度に書き込む
-    # -pad: 曲の長さを CD の区切り（1/75 秒）に合わせて無音で埋める
-    local -a burn_args=(-v dev="$dev" -dao -audio -pad)
-    if [ "$choice" == "TEST     試し書き（実際には書き込まずに動作だけ確認）" ]; then
-        burn_args=(-dummy "${burn_args[@]}")
+    local is_test=0
+    [ "$choice" == "TEST     試し書き（実際には書き込まずに動作だけ確認）" ] && is_test=1
+    if [ "$is_test" -eq 1 ]; then
         show_status "$C_MAIN" "[ 試し書き中 ]  実際には書き込みません"
     else
-        burn_args=(-eject "${burn_args[@]}")
-        show_status "$C_MAIN" "[ 書き込み中 ]  終わるまでディスクを取り出さないでください（数秒後に始まります）"
+        show_status "$C_MAIN" "[ 書き込み中 ]  終わるまでディスクを取り出さないでください"
     fi
     echo ""
 
-    "$writer" "${burn_args[@]}" "${wavs[@]}"
-    local rc=$?
+    # --- 書き込む ---
+    if [ "$writer" == "cdrdao" ]; then
+        local toc="$TEMP_CD_DIR/disc.toc" text_note=""
+        _write_toc "$toc" "$album" yes "${entries[@]}"
+        # 古い cdrdao（1.2.5 より前）は日本語の CD-Text を書けないので、曲名なしで書き込む
+        if ! cdrdao show-toc "$toc" &>/dev/null; then
+            _write_toc "$toc" "" no "${entries[@]}"
+            text_note="（cdrdao が古いため、曲名なしで書き込みました）"
+            show_status "$C_ERR" "cdrdao が古いため、曲名（CD-Text）なしで書き込みます"
+        fi
+        # -n: 書き込み前の 10 秒の待ち時間をなくす
+        # 1 曲目の前の 2 秒以外は曲間に無音を入れない（ファイルの長さのまま、つなげて書き込む）
+        if [ "$is_test" -eq 1 ]; then
+            cdrdao simulate --device "$dev" -n "$toc"
+        else
+            cdrdao write --device "$dev" -n --eject "$toc"
+        fi
+        rc=$?
+    else
+        # -dao: 曲間に余計な無音を入れずに一度に書き込む
+        # -pad: 曲の長さを CD の区切り（1/75 秒）に合わせて無音で埋める
+        local -a burn_args=(-v dev="$dev" -dao -audio -pad)
+        if [ "$is_test" -eq 1 ]; then
+            burn_args=(-dummy "${burn_args[@]}")
+        else
+            burn_args=(-eject "${burn_args[@]}")
+        fi
+        "$writer" "${burn_args[@]}" "${wavs[@]}"
+        rc=$?
+    fi
     rm -rf "$TEMP_CD_DIR"; TEMP_CD_DIR=""
     echo ""
 
     if [ "$rc" -ne 0 ]; then
         show_status "$C_ERR" "書き込みに失敗しました"
         echo "  上のメッセージを確認してください。"
-        echo "  ・使用済みの CD-R には書き込めません（CD-RW は消去してから）"
-        echo "  ・ドライブが -dao に対応していない場合があります"
-    elif [ "$choice" == "BURN     書き込む" ]; then
-        show_status "$C_OK" "[ 完了 ]  音楽CDに書き込みました（${#LOCAL_FILES[@]} 曲 / $(_fmt_time "$total")）"
+        echo "  ・ディスクが入っているか、空の CD-R か確認してください（使用済みの CD-R には書き込めません）"
+        echo "  ・CD-RW は消去してから書き込んでください"
+    elif [ "$is_test" -eq 0 ]; then
+        show_status "$C_OK" "[ 完了 ]  音楽CDに書き込みました（${#LOCAL_FILES[@]} 曲 / $(_fmt_time "$total")）${text_note:-}"
     else
         show_status "$C_OK" "[ 試し書き完了 ]  問題なく書き込めそうです。BURN で本番の書き込みをしてください"
     fi
@@ -1094,7 +1315,18 @@ run_local_process() {
     fi
     [ "$fail" -gt 0 ] && show_status "$C_ERR" "${fail} 個のファイルは変換に失敗しました（上のメッセージを確認してください）"
     [ "$skip" -gt 0 ] && echo "  ※ 時間指定・音量・形式のどれかを変えると、そのファイルも保存されます"
-    wait_key
+
+    # 保存できたファイルは、その場で再生して確認できるようにする
+    if [ "$ok" -gt 0 ]; then
+        echo ""
+        choice=$(fzf_menu "保存したファイルを再生して確認できます" \
+            "OK       メニューに戻る" \
+            "PLAY     保存したファイルを再生")
+        [ "$choice" == "PLAY     保存したファイルを再生" ] && play_local "${done_list[@]}"
+        clear
+    else
+        wait_key
+    fi
 }
 
 # 手元のファイルを選んで加工するメニュー
@@ -1147,7 +1379,24 @@ local_menu() {
         [ ${#usable[@]} -ne ${#LOCAL_FILES[@]} ] && sleep 1.5
         LOCAL_FILES=("${usable[@]}")
 
-        run_local_process
+        local label
+        label="$(basename "${LOCAL_FILES[0]}")"
+        [ ${#LOCAL_FILES[@]} -gt 1 ] && label="${#LOCAL_FILES[@]} 個のファイル"
+        while true; do
+            choice=$(fzf_menu "操作を選択  |  $label" \
+                "EDIT     加工する（時間指定・音量・形式・CD）" \
+                "PLAY     再生する" \
+                "BACK     戻る" \
+                "EXIT     終了")
+            [ "$choice" == "EXIT     終了" ] && do_exit
+            if [ -z "$choice" ] || [ "$choice" == "BACK     戻る" ]; then break; fi
+            if [ "$choice" == "PLAY     再生する" ]; then
+                play_local "${LOCAL_FILES[@]}"
+                continue
+            fi
+            run_local_process
+            break
+        done
     done
 }
 
@@ -1168,7 +1417,7 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
   -v, --version    バージョンと本体の場所を表示して終了
 
 メインメニュー:
-  SEARCH   キーワードで検索（上位15件）
+  SEARCH   キーワードで検索（上位 ${SEARCH_COUNT} 件。Tab で複数選ぶと、まとめて保存）
   URL      URL を直接入力
   LOCAL    手元のファイルを加工（下記）
   CONFIG   保存先フォルダを変更（次回以降も記憶）
@@ -1176,7 +1425,7 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
 
 動画を選んだあとの操作:
   STREAM   ストリーミング再生（Q で終了）
-  STREAM2  ストリーミング再生（STREAM で早送りすると固まる場合）
+  LISTEN   音声のみ再生（通信量が少ない）
   VIDEO    動画保存（1080p / 720p / 最高画質、MP4）
   AUDIO    音声保存（MP3 / M4A / BEST / WAV / FLAC）
            M4A・BEST は YouTube の音声をそのまま保存（劣化なし）
@@ -1191,11 +1440,12 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
 
 手元のファイルの加工（LOCAL）:
   選び方    保存先フォルダの一覧から選ぶ（Tab で複数選択）／場所を入力（ドラッグ＆ドロップ可）
+  操作      EDIT 加工する / PLAY 再生する（加工したファイルも、保存後にその場で再生できます）
   時間指定  「開始-終了」で切り出し（1ファイルを選んだときのみ）
   音量      正規化（音量をそろえる）／dB を指定して上げる・下げる
   形式      元のまま / MP3 / M4A / WAV / FLAC
             CDWAV  音楽CD用の WAV（保存先に CD_日時 フォルダを作り、曲順の番号付きで保存）
-            CDBURN 音楽CDに書き込む（選んだ順が曲順。cdrtools が必要）
+            CDBURN 音楽CDに書き込む（選んだ順が曲順。cdrdao なら曲名も書き込む）
   元のファイルは変更せず、同じフォルダに名前を変えて保存します
 
 操作:
@@ -1205,12 +1455,15 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
   fzf, yt-dlp, ffmpeg（ffprobe）  必須
   mpv                             再生するときのみ
   wl-copy / xclip / xsel          URL の自動コピーを使うときのみ
-  cdrecord（cdrtools）            音楽CDに書き込むときのみ
+  cdrdao（または cdrecord）       音楽CDに書き込むときのみ（cdrdao なら曲名入り）
 
 保存先の記録: ${LAST_DIR_FILE}
 現在の保存先: ${TARGET_DIR}
 
-うまく動かないときは、まず yt-dlp -U で yt-dlp を更新してください。
+設定ファイル: ${CONFIG_FILE}
+  ストリーミング再生の画質・検索結果の件数などを変えられます（中に説明があります）
+
+うまく動かないときは、まず yt-dlp を更新してください: $(ytdlp_update_cmd)
 EOF
 }
 
@@ -1303,7 +1556,7 @@ while true; do
         # awk で、配信中・配信予定の動画に印を付け、再生時間が無いときの空の " []" を取る
         yt-dlp --no-colors --flat-playlist \
             --print $'[%(uploader,channel|不明)s] %(title)s [%(duration_string|)s]\t%(id)s\t%(live_status|)s' \
-            "ytsearch15:$QUERY" 2> "$TEMP_ERR" \
+            "ytsearch${SEARCH_COUNT}:$QUERY" 2> "$TEMP_ERR" \
             | awk -F'\t' 'BEGIN { OFS = "\t" }
                 { sub(/ \[\]$/, "", $1) }
                 $3 == "is_live"     { $1 = "[LIVE] " $1 }
@@ -1317,7 +1570,7 @@ while true; do
             if grep -q "ERROR" "$TEMP_ERR"; then
                 show_status "$C_ERR" "検索に失敗しました"
                 grep "ERROR" "$TEMP_ERR" | tail -n 3
-                echo "yt-dlp が古い可能性があります。yt-dlp -U で更新してください。"
+                echo "yt-dlp が古い可能性があります。$(ytdlp_update_cmd) で更新してください。"
                 wait_key
             else
                 show_status "$C_ERR" "検索結果が見つかりませんでした"
@@ -1335,16 +1588,28 @@ while true; do
 
             # --delimiter/--with-nth でタブ以降(ID部分)を非表示にする。
             # 選択結果には元の行(表示部+タブ+ID)がそのまま返る。
-            SELECTED_LINE=$(fzf "${FZF_OPTS[@]}" \
-                --header="動画を選択（マウスクリック / ↑↓ / Enter）" \
+            # --multi: Tab で複数選ぶと、まとめて保存できる
+            SELECTED=$(fzf "${FZF_OPTS[@]}" \
+                --multi \
+                --header="動画を選択（マウスクリック / ↑↓ / Enter）　Tab で複数選ぶとまとめて保存" \
                 --header-first \
                 --no-sort \
                 --delimiter='\t' \
                 --with-nth=1 \
                 --height=80% < "$TEMP_LIST")
 
-            [ "$SELECTED_LINE" == "EXIT     終了" ] && do_exit
-            if [ -z "$SELECTED_LINE" ] || [ "$SELECTED_LINE" == "BACK     検索に戻る" ]; then break; fi
+            [ -z "$SELECTED" ] && break
+            # BACK / EXIT が混ざっていたら、そちらを優先する
+            grep -qx "EXIT     終了" <<< "$SELECTED" && do_exit
+            grep -qx "BACK     検索に戻る" <<< "$SELECTED" && break
+
+            # 複数選ばれたら、まとめて保存へ
+            if [ "$(grep -c . <<< "$SELECTED")" -gt 1 ]; then
+                mapfile -t SELECTED_LINES <<< "$SELECTED"
+                batch_download "${SELECTED_LINES[@]}"
+                continue
+            fi
+            SELECTED_LINE="$SELECTED"
 
             VIDEO_ID=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $2}')
             DISPLAY_TITLE=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $1}')

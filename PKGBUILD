@@ -4,7 +4,7 @@
 # （同じフォルダにある yt-fzf.sh / LICENSE / README.md をパッケージにします）
 
 pkgname=yt-fzf
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="Search, stream and download YouTube videos, edit local audio/video and burn audio CDs from an fzf menu"
 arch=('any')
@@ -17,7 +17,8 @@ conflicts=('yt-fzf-sh')
 replaces=('yt-fzf-sh')
 optdepends=(
     'mpv: streaming playback'
-    'cdrtools: burn audio CDs'
+    'cdrdao: burn audio CDs with track titles (CD-Text)'
+    'cdrtools: burn audio CDs without track titles'
     'wl-clipboard: copy URL to clipboard (Wayland)'
     'xclip: copy URL to clipboard (X11)'
     'xsel: copy URL to clipboard (X11)'
