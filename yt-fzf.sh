@@ -8,7 +8,7 @@
 
 # --- 設定 ---
 # バージョン（PKGBUILD の pkgver と同じ値にする）
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
@@ -966,24 +966,60 @@ _tag() {
 }
 
 # cdrdao 用の TOC ファイル（曲順・曲名などを書いた設計図）を作る。
-#   $1 TOC の保存先 / $2 アルバム名（空なら CD-Text なし） / $3 yes なら CD-Text を書く
+#   $1 TOC の保存先 / $2 CD のタイトル（空なら「CD 日付」） / $3 yes なら CD-Text を書く
 #   続く引数: 「WAVのパス<TAB>曲名<TAB>アーティスト」を曲順に
+#
+# CD-Text では、タイトル（TITLE）とアーティスト（PERFORMER）を CD 全体とすべての曲に
+# 書かないと、書き込み時にエラーになる（空の文字も「書いていない」扱いになる）。
+# そのため、空のものは次のように埋める。
+#   CD のタイトル: 「CD 日付」
+#   曲名: ファイル名（タグもファイル名も使えなければ「トラック 番号」）
+#   アーティスト: タグの値。無い曲は、ほかの曲のアーティストが1人ならその人、それ以外は「不明」
+#   CD 全体のアーティスト: 全曲が同じ人ならその人、複数なら「V.A.」（いろいろなアーティスト）
 _write_toc() {
     local toc="$1" album="$2" use_text="$3"; shift 3
-    local entry wav title artist
+    local entry wav title artist n=0 a
+    local disc_artist="" track_default="不明"
+    local -a names=()
+
+    album=$(_cdtext_str "$album")
+    [ -z "$album" ] && album="CD $(date +%Y-%m-%d)"
+
+    # 曲に付いているアーティストの種類を数える
+    for entry in "$@"; do
+        IFS=$'\t' read -r wav title artist <<< "$entry"
+        a=$(_cdtext_str "$artist")
+        [ -z "$a" ] && continue
+        local known=0 k
+        for k in "${names[@]}"; do [ "$k" == "$a" ] && known=1; done
+        [ "$known" -eq 0 ] && names+=("$a")
+    done
+    if [ ${#names[@]} -eq 1 ]; then
+        disc_artist="${names[0]}"
+        track_default="${names[0]}"
+    elif [ ${#names[@]} -gt 1 ]; then
+        disc_artist="V.A."
+    else
+        disc_artist="不明"
+    fi
+
     {
         echo "CD_DA"
         if [ "$use_text" == "yes" ]; then
             # 105 = 日本語（CD-Text の言語コード）。ENCODING_MS_JIS で Shift_JIS として書き込む
             printf 'CD_TEXT {\n  LANGUAGE_MAP {\n    0 : 105\n  }\n  LANGUAGE 0 {\n'
-            printf '    ENCODING_MS_JIS\n    TITLE "%s"\n    PERFORMER ""\n  }\n}\n' "$(_cdtext_str "$album")"
+            printf '    ENCODING_MS_JIS\n    TITLE "%s"\n    PERFORMER "%s"\n  }\n}\n' "$album" "$disc_artist"
         fi
         for entry in "$@"; do
+            n=$((n + 1))
             IFS=$'\t' read -r wav title artist <<< "$entry"
             printf '\nTRACK AUDIO\n'
             if [ "$use_text" == "yes" ]; then
-                printf 'CD_TEXT {\n  LANGUAGE 0 {\n    TITLE "%s"\n    PERFORMER "%s"\n  }\n}\n' \
-                    "$(_cdtext_str "$title")" "$(_cdtext_str "$artist")"
+                title=$(_cdtext_str "$title")
+                [ -z "$title" ] && title="トラック $n"
+                artist=$(_cdtext_str "$artist")
+                [ -z "$artist" ] && artist="$track_default"
+                printf 'CD_TEXT {\n  LANGUAGE 0 {\n    TITLE "%s"\n    PERFORMER "%s"\n  }\n}\n' "$title" "$artist"
             fi
             printf 'FILE "%s" 0\n' "$wav"
         done
@@ -1075,7 +1111,7 @@ burn_audio_cd() {
     # --- CD のタイトル（cdrdao のときだけ） ---
     if [ "$writer" == "cdrdao" ]; then
         out=$(echo "" | fzf "${FZF_OPTS[@]}" \
-            --header="CD のタイトル（アルバム名）を入力して Enter。空のまま Enter ならタイトルなし（ESC で戻る）" \
+            --header="CD のタイトル（アルバム名）を入力して Enter。空のまま Enter なら「CD $(date +%Y-%m-%d)」（ESC で戻る）" \
             --header-first --height=30% --print-query --no-sort --query="")
         rc=$?
         if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then clear; return 0; fi   # ESC
@@ -1125,6 +1161,7 @@ burn_audio_cd() {
         local toc="$TEMP_CD_DIR/disc.toc" text_note=""
         _write_toc "$toc" "$album" yes "${entries[@]}"
         # 古い cdrdao（1.2.5 より前）は日本語の CD-Text を書けないので、曲名なしで書き込む
+        # （show-toc は書式を確かめるだけで、CD-Text の項目がそろっているかまでは確かめない）
         if ! cdrdao show-toc "$toc" &>/dev/null; then
             _write_toc "$toc" "" no "${entries[@]}"
             text_note="（cdrdao が古いため、曲名なしで書き込みました）"
