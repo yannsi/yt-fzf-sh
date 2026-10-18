@@ -4,9 +4,9 @@
 # （同じフォルダにある yt-fzf.sh / LICENSE / README.md をパッケージにします）
 
 pkgname=yt-fzf
-pkgver=1.0.8
+pkgver=1.1.0
 pkgrel=1
-pkgdesc="Search, stream and download YouTube videos from an fzf menu"
+pkgdesc="Search, stream and download YouTube videos, edit local audio/video and burn audio CDs from an fzf menu"
 arch=('any')
 url="https://github.com/yannsi/yt-fzf-sh"
 license=('MIT')
@@ -17,6 +17,7 @@ conflicts=('yt-fzf-sh')
 replaces=('yt-fzf-sh')
 optdepends=(
     'mpv: streaming playback'
+    'cdrtools: burn audio CDs'
     'wl-clipboard: copy URL to clipboard (Wayland)'
     'xclip: copy URL to clipboard (X11)'
     'xsel: copy URL to clipboard (X11)'

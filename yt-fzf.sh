@@ -8,7 +8,7 @@
 
 # --- 設定 ---
 # バージョン（PKGBUILD の pkgver と同じ値にする）
-VERSION="1.0.8"
+VERSION="1.1.0"
 
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
@@ -70,6 +70,12 @@ TITLE_MAX_BYTES_RANGE=180  # 範囲指定（ファイル名に時間範囲が付
 # 重いときは height<=720 などに下げる。音声だけで再生したいときは 'ba' にする。
 STREAM_FORMAT='bv*[height<=1080]+ba/b'
 
+# 手元のファイル（LOCAL）の一覧に出す、音声・動画ファイルの拡張子
+LOCAL_EXTS="mp3|m4a|aac|opus|ogg|oga|wav|flac|wma|webm|mp4|mkv|mov|m4v|avi"
+
+# 音楽CDに入る時間の上限（秒）。一般的な 80 分の CD-R は 4800 秒（74 分の CD-R は 4440 秒）
+CD_MAX_SECONDS=4800
+
 # --- 関数定義 ---
 
 check_dependency() {
@@ -89,9 +95,11 @@ TEMP_ERR=$(mktemp)      # 検索時のエラー出力
 TEMP_PATHS=$(mktemp)    # 保存されたファイルのパス
 TEMP_MARKER=$(mktemp)   # ダウンロード開始時刻の目印（スキップ判定用）
 TEMP_PLAYLOG=$(mktemp)  # 再生時の mpv の出力（失敗したときの表示用）
+TEMP_CD_DIR=""          # 音楽CDに書き込む WAV を置く一時フォルダ（書き込むときだけ作る）
 
 cleanup() {
     rm -f "$TEMP_RESULT" "$TEMP_LIST" "$TEMP_ERR" "$TEMP_PATHS" "$TEMP_MARKER" "$TEMP_PLAYLOG"
+    [ -n "$TEMP_CD_DIR" ] && rm -rf "$TEMP_CD_DIR"
 }
 trap cleanup EXIT
 
@@ -598,6 +606,551 @@ show_action_menu() {
     done
 }
 
+# ============================================================
+# 手元のファイル（LOCAL）: 時間指定・音量・形式変換・音楽CD
+# ============================================================
+
+# 貼り付け・ドラッグ＆ドロップされたパスを整える。
+# 'パス' / "パス" の引用符、file:// で始まる形式、~ 、\ でエスケープされた空白に対応する。
+_clean_path() {
+    local p="$1"
+    p="${p#"${p%%[![:space:]]*}"}"   # 先頭の空白を除く
+    p="${p%"${p##*[![:space:]]}"}"   # 末尾の空白を除く
+    if [[ "$p" == \'*\' || "$p" == \"*\" ]]; then
+        p="${p:1:${#p}-2}"
+    fi
+    if [[ "$p" == file://* ]]; then
+        p="${p#file://}"
+        p=$(printf '%b' "${p//%/\\x}")   # %20 などの URL エンコードを元に戻す
+    fi
+    # shellcheck disable=SC2088  # 入力された文字の「~」をそのまま比べている
+    [[ "$p" == "~" || "$p" == "~/"* ]] && p="${HOME}${p:1}"
+    p="${p//\\ / }"
+    echo "$p"
+}
+
+# 音声が入っているか
+_has_audio() {
+    [ -n "$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$1" 2>/dev/null)" ]
+}
+
+# 映像が入っているか（MP3 などのジャケット画像は映像として扱わない）
+_has_video() {
+    ffprobe -v error -select_streams v -show_entries stream_disposition=attached_pic \
+        -of csv=p=0 "$1" 2>/dev/null | grep -qx 0
+}
+
+# 長さ（秒、整数）。分からなければ空
+_duration() {
+    local d
+    d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null)
+    [[ "$d" =~ ^[0-9]+ ]] && echo "${BASH_REMATCH[0]}"
+}
+
+# 秒を「時:分:秒」または「分:秒」で表す
+_fmt_time() {
+    local t="$1"
+    if (( t >= 3600 )); then
+        printf '%d:%02d:%02d' $((t / 3600)) $((t % 3600 / 60)) $((t % 60))
+    else
+        printf '%d:%02d' $((t / 60)) $((t % 60))
+    fi
+}
+
+# 文字列を指定バイト数以内に切り詰める（日本語の文字の途中では切らない）
+_trim_bytes() {
+    local s="$1" max="$2"
+    while (( $(printf '%s' "$s" | wc -c) > max )); do
+        s="${s%?}"
+    done
+    echo "$s"
+}
+
+# 同じ名前のファイルがあれば「名前 (2).拡張子」のように番号を付けたパスを返す
+_unique_path() {
+    local dir="$1" base="$2" ext="$3" path n=2
+    path="$dir/$base.$ext"
+    while [ -e "$path" ]; do
+        path="$dir/$base ($n).$ext"
+        n=$((n + 1))
+    done
+    echo "$path"
+}
+
+# フォルダ内の音声・動画ファイルを一覧から選ぶ（Tab で複数選択）。
+# 選んだファイルは配列 LOCAL_FILES に入る（選んだ順）。選ばなかったら 1 を返す。
+# 一覧は新しいファイルが上。サブフォルダは 3 階層まで探す。
+pick_from_folder() {
+    local dir="$1" list selected line
+    LOCAL_FILES=()
+
+    list=$(find "$dir" -maxdepth 3 -type f -regextype posix-extended \
+            -iregex ".*\.(${LOCAL_EXTS})" \
+            ! -name '*.norm-tmp.*' ! -name '*.local-tmp.*' ! -path '*/.*' \
+            -printf '%T@\t%P\n' 2>/dev/null | sort -rn | cut -f2-)
+    if [ -z "$list" ]; then
+        show_status "$C_ERR" "音声・動画ファイルが見つかりませんでした"
+        echo "  フォルダ: $dir"
+        wait_key
+        return 1
+    fi
+
+    selected=$(printf '%s\n' "$list" | fzf "${FZF_OPTS[@]}" --multi \
+        --header="ファイルを選択  |  $dir
+Tab で複数選択（選んだ順が CD の曲順）、Enter で決定、ESC で戻る" \
+        --header-first \
+        --no-sort \
+        --height=80%)
+    [ -z "$selected" ] && return 1
+
+    while IFS= read -r line; do
+        [ -n "$line" ] && LOCAL_FILES+=("$dir/$line")
+    done <<< "$selected"
+    return 0
+}
+
+# 音量の上げ下げを dB で入力させる。例: 3（上げる） / -6（下げる）
+# 空入力(ESC)なら空文字を返す。結果は標準出力で返すため、エラー表示は標準エラーに出す。
+prompt_gain_input() {
+    local input
+    while true; do
+        input=$(echo "" | fzf "${FZF_OPTS[@]}" \
+            --header="音量の変化を dB で入力  例: 3（上げる） / -6（下げる）  ※ 6dB でおよそ2倍・半分の大きさ（ESCで戻る）" \
+            --header-first --height=30% --print-query --no-sort --query="" | tail -1)
+
+        # 全角の数字・記号を半角にそろえ、空白と「dB」を取り除く
+        input=$(printf '%s' "$input" | sed 'y/０１２３４５６７８９．＋－ー/0123456789.+--/')
+        input="${input//[[:space:]]/}"
+        input="${input%[dD][bB]}"
+
+        if [ -z "$input" ]; then
+            echo ""
+            return
+        fi
+
+        if ! [[ "$input" =~ ^[+-]?[0-9]+(\.[0-9]+)?$ ]]; then
+            show_status "$C_ERR" "数字で入力してください　例: 3 / -6 / 1.5" >&2
+            sleep 1.5
+            continue
+        fi
+        if awk -v g="$input" 'BEGIN { exit !(g == 0 || g > 30 || g < -30) }'; then
+            show_status "$C_ERR" "-30 から 30 の範囲で、0 以外の値を入力してください" >&2
+            sleep 1.5
+            continue
+        fi
+
+        echo "${input#+}"
+        return
+    done
+}
+
+# 1つのファイルを ffmpeg で加工して保存する。
+#   $1 入力 / $2 出力
+#   $3 出力の種類（same = 元の形式のまま / mp3 / m4a / wav / flac / cdwav = 音楽CD用 WAV）
+#   $4 開始秒（空なら先頭から） / $5 長さ秒（空なら最後まで） / $6 音声フィルタ（空ならなし）
+convert_local_file() {
+    local in="$1" out="$2" kind="$3" start="$4" len="$5" af="$6"
+    local ext="${out##*.}"
+    local tmp="${out%.*}.local-tmp.${ext}"
+    local in_args=() map_args=() codec_args=() other_args=() rate
+
+    [ -n "$start" ] && in_args=(-ss "$start")
+    [ -n "$len" ] && other_args+=(-t "$len")
+    [ -n "$af" ] && other_args+=(-af "$af")
+
+    # 元のサンプルレートを保つ（loudnorm は既定で 192kHz にしてしまうため指定し直す）
+    rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$in" 2>/dev/null)
+    [[ "$rate" =~ ^[0-9]+$ ]] || rate=48000
+
+    case "$kind" in
+        mp3)   map_args=(-map 0:a:0); codec_args=(-c:a libmp3lame -q:a 0) ;;
+        m4a)   map_args=(-map 0:a:0); codec_args=(-c:a aac -b:a 256k) ;;
+        wav)   map_args=(-map 0:a:0); codec_args=(-c:a pcm_s16le) ;;
+        flac)  map_args=(-map 0:a:0); codec_args=(-c:a flac) ;;
+        cdwav) map_args=(-map 0:a:0); codec_args=(-c:a pcm_s16le -ac 2); rate=44100 ;;  # CD の規格
+        same)
+            # 音声は拡張子に合った形式で作り直す
+            case "${ext,,}" in
+                mp3|avi)                codec_args=(-c:a libmp3lame -q:a 0) ;;
+                m4a|aac|mp4|m4v|mov|mkv) codec_args=(-c:a aac -b:a 192k) ;;
+                opus|ogg|oga|webm)      codec_args=(-c:a libopus -b:a 160k); rate=48000 ;;  # Opus は 48kHz 固定
+                flac)                   codec_args=(-c:a flac) ;;
+                wav)                    codec_args=(-c:a pcm_s16le) ;;
+                wma)                    codec_args=(-c:a wmav2 -b:a 192k) ;;
+            esac
+            if _has_video "$in"; then
+                map_args=(-map 0:v:0 -map 0:a:0)
+                if [ -n "$start$len" ]; then
+                    # 切り出すときは、位置を正確にするため映像も作り直す
+                    if [ "${ext,,}" == "webm" ]; then
+                        codec_args+=(-c:v libvpx-vp9 -crf 32 -b:v 0 -row-mt 1 -cpu-used 4)
+                    else
+                        codec_args+=(-c:v libx264 -crf 18 -preset veryfast)
+                    fi
+                else
+                    codec_args+=(-c:v copy)   # 音量だけ変えるときは映像はそのまま
+                fi
+                [[ "${ext,,}" =~ ^(mp4|m4v|mov)$ ]] && codec_args+=(-movflags +faststart)
+            else
+                map_args=(-map 0:a:0)
+            fi
+            ;;
+    esac
+
+    if ffmpeg -nostdin -hide_banner -loglevel error -stats -y \
+            "${in_args[@]}" -i "$in" -map_metadata 0 \
+            "${map_args[@]}" "${other_args[@]}" "${codec_args[@]}" -ar "$rate" "$tmp"; then
+        mv -f "$tmp" "$out"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# 音楽CDの書き込みソフト（cdrecord / wodim）を探す
+_find_cd_writer() {
+    if command -v cdrecord &>/dev/null; then
+        echo cdrecord
+    elif command -v wodim &>/dev/null; then
+        echo wodim
+    fi
+}
+
+# 選んだファイルを音楽CDに書き込む。
+#   $1 開始秒 / $2 長さ秒 / $3 音声フィルタ（いずれも空なら指定なし。時間指定は1ファイルのときだけ）
+burn_audio_cd() {
+    local start="$1" len="$2" af="$3"
+    local writer dev total=0 d i f choice
+    local -a devs durs
+
+    writer=$(_find_cd_writer)
+    if [ -z "$writer" ]; then
+        show_status "$C_ERR" "CD の書き込みには cdrtools（cdrecord）が必要です"
+        echo "  インストール: sudo pacman -S cdrtools"
+        wait_key
+        return 0
+    fi
+
+    # --- CD ドライブを選ぶ ---
+    for d in /dev/sr[0-9]*; do
+        [ -e "$d" ] && devs+=("$d")
+    done
+    if [ ${#devs[@]} -eq 0 ]; then
+        show_status "$C_ERR" "CD ドライブが見つかりません（/dev/sr0 など）"
+        echo "  ドライブがつながっているか確認してください。"
+        wait_key
+        return 0
+    elif [ ${#devs[@]} -eq 1 ]; then
+        dev="${devs[0]}"
+    else
+        dev=$(fzf_menu "書き込む CD ドライブを選択" "${devs[@]}")
+        [ -z "$dev" ] && return 0
+    fi
+
+    # --- 合計時間を確認する ---
+    for f in "${LOCAL_FILES[@]}"; do
+        d="$len"
+        [ -z "$d" ] && d=$(_duration "$f")
+        if [ -z "$d" ]; then
+            show_status "$C_ERR" "長さを確認できないファイルがあります"
+            echo "  $f"
+            wait_key
+            return 0
+        fi
+        durs+=("$d")
+        total=$((total + d))
+    done
+
+    if (( total > CD_MAX_SECONDS )); then
+        show_status "$C_ERR" "合計 $(_fmt_time "$total") で、CD に入る時間（$(_fmt_time "$CD_MAX_SECONDS")）を超えています"
+        echo "  曲を減らすか、時間指定で短くしてください。"
+        wait_key
+        return 0
+    fi
+
+    # --- 曲順と合計時間を見せて確認する ---
+    clear
+    show_status "$C_MAIN" "[ 音楽CDに書き込む曲 ]  ドライブ: $dev"
+    for i in "${!LOCAL_FILES[@]}"; do
+        printf '  %2d. %s  (%s)\n' $((i + 1)) "$(basename "${LOCAL_FILES[$i]}")" "$(_fmt_time "${durs[$i]}")"
+    done
+    echo "  合計: $(_fmt_time "$total")（${#LOCAL_FILES[@]} 曲）"
+    (( total > 4440 )) && echo "  ※ 74 分を超えているため、80 分の CD-R が必要です"
+    echo ""
+
+    choice=$(fzf_menu "書き込みますか？（空の CD-R を入れてから選んでください）" \
+        "BURN     書き込む" \
+        "TEST     試し書き（実際には書き込まずに動作だけ確認）" \
+        "BACK     戻る" \
+        "EXIT     終了")
+    [ "$choice" == "EXIT     終了" ] && do_exit
+    if [ -z "$choice" ] || [ "$choice" == "BACK     戻る" ]; then clear; return 0; fi
+
+    # --- ディスクが入っているか確認する ---
+    if ! "$writer" dev="$dev" -atip &>/dev/null; then
+        show_status "$C_ERR" "ディスクが入っていないか、読み取れません"
+        echo "  空の CD-R を入れて、数秒待ってからやり直してください。"
+        wait_key
+        return 0
+    fi
+
+    # --- CD 用の WAV（44.1kHz / 16bit / ステレオ）を一時フォルダに作る ---
+    # /tmp はメモリ上にあることが多く、CD 1枚分（最大 800MB 程度）を置くと重くなるため、
+    # ホームのキャッシュフォルダを使う
+    local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}"
+    mkdir -p "$cache_dir"
+    TEMP_CD_DIR=$(mktemp -d "$cache_dir/yt-fzf-cd.XXXXXX")
+    local -a wavs
+    echo ""
+    for i in "${!LOCAL_FILES[@]}"; do
+        f="${LOCAL_FILES[$i]}"
+        show_status "$C_MAIN" "[ CD 用に変換中 $((i + 1))/${#LOCAL_FILES[@]} ] $(basename "$f")"
+        wavs+=("$TEMP_CD_DIR/$(printf '%02d' $((i + 1))).wav")
+        if ! convert_local_file "$f" "${wavs[$i]}" cdwav "$start" "$len" "$af"; then
+            show_status "$C_ERR" "変換に失敗しました: $(basename "$f")"
+            rm -rf "$TEMP_CD_DIR"; TEMP_CD_DIR=""
+            wait_key
+            return 0
+        fi
+    done
+
+    # --- 書き込む ---
+    # -dao: 曲間に余計な無音を入れずに一度に書き込む
+    # -pad: 曲の長さを CD の区切り（1/75 秒）に合わせて無音で埋める
+    local -a burn_args=(-v dev="$dev" -dao -audio -pad)
+    if [ "$choice" == "TEST     試し書き（実際には書き込まずに動作だけ確認）" ]; then
+        burn_args=(-dummy "${burn_args[@]}")
+        show_status "$C_MAIN" "[ 試し書き中 ]  実際には書き込みません"
+    else
+        burn_args=(-eject "${burn_args[@]}")
+        show_status "$C_MAIN" "[ 書き込み中 ]  終わるまでディスクを取り出さないでください（数秒後に始まります）"
+    fi
+    echo ""
+
+    "$writer" "${burn_args[@]}" "${wavs[@]}"
+    local rc=$?
+    rm -rf "$TEMP_CD_DIR"; TEMP_CD_DIR=""
+    echo ""
+
+    if [ "$rc" -ne 0 ]; then
+        show_status "$C_ERR" "書き込みに失敗しました"
+        echo "  上のメッセージを確認してください。"
+        echo "  ・使用済みの CD-R には書き込めません（CD-RW は消去してから）"
+        echo "  ・ドライブが -dao に対応していない場合があります"
+    elif [ "$choice" == "BURN     書き込む" ]; then
+        show_status "$C_OK" "[ 完了 ]  音楽CDに書き込みました（${#LOCAL_FILES[@]} 曲 / $(_fmt_time "$total")）"
+    else
+        show_status "$C_OK" "[ 試し書き完了 ]  問題なく書き込めそうです。BURN で本番の書き込みをしてください"
+    fi
+    wait_key
+}
+
+# 選んだファイル（LOCAL_FILES）に、時間指定・音量・形式変換をまとめて行う
+run_local_process() {
+    local count=${#LOCAL_FILES[@]}
+    local label start="" len="" range_tag="" af="" vol_tag="" kind out_ext
+    local choice
+
+    if [ "$count" -eq 1 ]; then
+        label="$(basename "${LOCAL_FILES[0]}")"
+    else
+        label="${count} 個のファイル"
+    fi
+
+    # --- 時間指定（1ファイルのときだけ） ---
+    if [ "$count" -eq 1 ]; then
+        choice=$(fzf_menu "時間指定で切り出しますか？  |  $label" \
+            "FULL     全体を使う" \
+            "RANGE    範囲を指定する" \
+            "BACK     戻る" \
+            "EXIT     終了")
+        [ "$choice" == "EXIT     終了" ] && do_exit
+        if [ -z "$choice" ] || [ "$choice" == "BACK     戻る" ]; then return 0; fi
+
+        if [ "$choice" == "RANGE    範囲を指定する" ]; then
+            local range s e dur
+            range=$(prompt_range_input)
+            [ -z "$range" ] && return 0
+            s="${range%-*}"; e="${range##*-}"
+            start=$(_to_seconds "$s")
+            len=$(( $(_to_seconds "$e") - start ))
+            dur=$(_duration "${LOCAL_FILES[0]}")
+            if [ -n "$dur" ] && (( start >= dur )); then
+                show_status "$C_ERR" "開始時間がファイルの長さ（$(_fmt_time "$dur")）を超えています"
+                wait_key
+                return 0
+            fi
+            range_tag=" [${s//:/-}_${e//:/-}]"
+        fi
+    fi
+
+    # --- 音量 ---
+    choice=$(fzf_menu "音量を調整しますか？  |  $label" \
+        "NO       変更しない" \
+        "NORM     正規化する（ほかの曲と音量をそろえる）" \
+        "GAIN     上げる / 下げる（dB で指定）" \
+        "BACK     戻る" \
+        "EXIT     終了")
+    [ "$choice" == "EXIT     終了" ] && do_exit
+    if [ -z "$choice" ] || [ "$choice" == "BACK     戻る" ]; then return 0; fi
+    case "${choice%% *}" in
+        NORM)
+            af="$LOUDNORM_FILTER"
+            vol_tag=" [正規化]" ;;
+        GAIN)
+            local gain
+            gain=$(prompt_gain_input)
+            [ -z "$gain" ] && return 0
+            af="volume=${gain}dB"
+            # 上げるときは、音が割れないよう上限（-1dB）を超えた部分だけ抑える
+            [[ "$gain" != -* ]] && af+=",alimiter=limit=0.891:level=false"
+            [[ "$gain" == -* ]] && vol_tag=" [${gain}dB]" || vol_tag=" [+${gain}dB]"
+            ;;
+    esac
+
+    # --- 保存の形式 ---
+    choice=$(fzf_menu "保存の形式を選択  |  $label" \
+        "SAME     元の形式のまま" \
+        "MP3      どの機器でも再生できる" \
+        "M4A      AAC（スマホ向け）" \
+        "WAV      編集ソフト用（劣化なし・サイズ大）" \
+        "FLAC     編集ソフト用（劣化なし・WAV より小さい）" \
+        "CDWAV    音楽CD用の WAV（別のソフトで CD に焼く用）" \
+        "CDBURN   音楽CDに書き込む" \
+        "BACK     戻る" \
+        "EXIT     終了")
+    [ "$choice" == "EXIT     終了" ] && do_exit
+    if [ -z "$choice" ] || [ "$choice" == "BACK     戻る" ]; then return 0; fi
+    kind="${choice%% *}"; kind="${kind,,}"
+
+    if [ "$kind" == "cdburn" ]; then
+        burn_audio_cd "$start" "$len" "$af"
+        return 0
+    fi
+
+    # --- 保存先を決める ---
+    # CD 用 WAV は、保存先フォルダに「CD_日時」のフォルダを作り、曲順の番号を付けて並べる。
+    # それ以外は、元のファイルと同じフォルダに名前を変えて保存する（元のファイルは変更しない）。
+    local cd_dir=""
+    if [ "$kind" == "cdwav" ]; then
+        cd_dir="$TARGET_DIR/CD_$(date +%Y%m%d-%H%M%S)"
+        if ! mkdir -p "$cd_dir"; then
+            show_status "$C_ERR" "フォルダを作れませんでした: $cd_dir"
+            wait_key
+            return 0
+        fi
+    fi
+
+    local i f in_ext base dir out ok=0 skip=0 fail=0
+    local -a done_list
+    echo ""
+    for i in "${!LOCAL_FILES[@]}"; do
+        f="${LOCAL_FILES[$i]}"
+        in_ext="${f##*.}"
+        base="$(basename "${f%.*}")"
+
+        case "$kind" in
+            same)  out_ext="$in_ext" ;;
+            cdwav) out_ext="wav" ;;
+            *)     out_ext="$kind" ;;
+        esac
+
+        # 何も変わらない（同じ形式で、時間指定も音量の変更もない）ファイルは作らない
+        if [ "$kind" != "cdwav" ] && [ "${out_ext,,}" == "${in_ext,,}" ] && [ -z "$range_tag$vol_tag" ]; then
+            show_status "$C_ERR" "[ スキップ ] 変更する内容がありません: $(basename "$f")"
+            skip=$((skip + 1))
+            continue
+        fi
+
+        if [ "$kind" == "cdwav" ]; then
+            out=$(_unique_path "$cd_dir" "$(printf '%02d' $((i + 1))) $(_trim_bytes "$base" 180)" wav)
+        else
+            dir="$(dirname "$f")"
+            [ -w "$dir" ] || dir="$TARGET_DIR"   # 書き込めない場所なら保存先フォルダへ
+            out=$(_unique_path "$dir" "$(_trim_bytes "$base" 180)${range_tag}${vol_tag}" "$out_ext")
+        fi
+
+        show_status "$C_MAIN" "[ 変換中 $((i + 1))/${count} ] $(basename "$f")"
+        if convert_local_file "$f" "$out" "$kind" "$start" "$len" "$af"; then
+            ok=$((ok + 1))
+            done_list+=("$out")
+        else
+            show_status "$C_ERR" "[ 失敗 ] $(basename "$f")"
+            fail=$((fail + 1))
+        fi
+    done
+    echo ""
+
+    if [ "$ok" -gt 0 ]; then
+        show_status "$C_OK" "[ 完了 ] ${ok} 個のファイルを保存しました"
+        if [ -n "$cd_dir" ]; then
+            echo "  保存先: $cd_dir"
+            echo "  （ファイル名の番号順に CD に焼いてください）"
+        else
+            printf '  %s\n' "${done_list[@]}"
+        fi
+    elif [ -n "$cd_dir" ]; then
+        rmdir "$cd_dir" 2>/dev/null   # 1つもできなかったら空のフォルダは消す
+    fi
+    [ "$fail" -gt 0 ] && show_status "$C_ERR" "${fail} 個のファイルは変換に失敗しました（上のメッセージを確認してください）"
+    [ "$skip" -gt 0 ] && echo "  ※ 時間指定・音量・形式のどれかを変えると、そのファイルも保存されます"
+    wait_key
+}
+
+# 手元のファイルを選んで加工するメニュー
+local_menu() {
+    local choice input p f
+    local -a usable
+
+    while true; do
+        choice=$(fzf_menu "手元のファイルを加工  |  ファイルの選び方" \
+            "LIST     保存先フォルダから選ぶ" \
+            "PATH     ファイル / フォルダの場所を入力" \
+            "BACK     戻る" \
+            "EXIT     終了")
+        [ "$choice" == "EXIT     終了" ] && do_exit
+        if [ -z "$choice" ] || [ "$choice" == "BACK     戻る" ]; then return 0; fi
+
+        if [ "$choice" == "LIST     保存先フォルダから選ぶ" ]; then
+            pick_from_folder "$TARGET_DIR" || continue
+        else
+            input=$(echo "" | fzf "${FZF_OPTS[@]}" \
+                --header="ファイルまたはフォルダの場所を入力して Enter（ドラッグ＆ドロップ可。ESC で戻る）" \
+                --header-first --height=30% --print-query --no-sort --query="" | tail -1)
+            p=$(_clean_path "$input")
+            [ -z "$p" ] && continue
+            if [ -d "$p" ]; then
+                pick_from_folder "$(realpath "$p")" || continue
+            elif [ -f "$p" ]; then
+                LOCAL_FILES=("$(realpath "$p")")
+            else
+                show_status "$C_ERR" "ファイルまたはフォルダが見つかりません"
+                echo "  $p"
+                wait_key
+                continue
+            fi
+        fi
+
+        # 音声の入っていないファイル（画像など）は除く
+        usable=()
+        for f in "${LOCAL_FILES[@]}"; do
+            if _has_audio "$f"; then
+                usable+=("$f")
+            else
+                show_status "$C_ERR" "音声が入っていないため除きます: $(basename "$f")"
+            fi
+        done
+        if [ ${#usable[@]} -eq 0 ]; then
+            wait_key
+            continue
+        fi
+        [ ${#usable[@]} -ne ${#LOCAL_FILES[@]} ] && sleep 1.5
+        LOCAL_FILES=("${usable[@]}")
+
+        run_local_process
+    done
+}
+
 show_help() {
     local name
     name=$(basename "$0")
@@ -607,6 +1160,7 @@ yt-fzf v${VERSION}
 使い方: ${name} [オプション]
 
 fzf のメニューで YouTube 動画を検索・再生・保存するツールです。
+手元の音声・動画ファイルの加工（時間指定・音量・音楽CD）もできます。
 オプションなしで起動するとメニューが開きます。
 
 オプション:
@@ -616,6 +1170,7 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
 メインメニュー:
   SEARCH   キーワードで検索（上位15件）
   URL      URL を直接入力
+  LOCAL    手元のファイルを加工（下記）
   CONFIG   保存先フォルダを変更（次回以降も記憶）
   EXIT     終了
 
@@ -634,6 +1189,15 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
             ファイル名に範囲が付きます（例: タイトル [0-00_1-00].mp3）
   音量正規化  音量をそろえます（形式・サンプルレートは元のまま）
 
+手元のファイルの加工（LOCAL）:
+  選び方    保存先フォルダの一覧から選ぶ（Tab で複数選択）／場所を入力（ドラッグ＆ドロップ可）
+  時間指定  「開始-終了」で切り出し（1ファイルを選んだときのみ）
+  音量      正規化（音量をそろえる）／dB を指定して上げる・下げる
+  形式      元のまま / MP3 / M4A / WAV / FLAC
+            CDWAV  音楽CD用の WAV（保存先に CD_日時 フォルダを作り、曲順の番号付きで保存）
+            CDBURN 音楽CDに書き込む（選んだ順が曲順。cdrtools が必要）
+  元のファイルは変更せず、同じフォルダに名前を変えて保存します
+
 操作:
   ↑↓ / マウス で選択、Enter で決定、ESC または BACK で戻る
 
@@ -641,6 +1205,7 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
   fzf, yt-dlp, ffmpeg（ffprobe）  必須
   mpv                             再生するときのみ
   wl-copy / xclip / xsel          URL の自動コピーを使うときのみ
+  cdrecord（cdrtools）            音楽CDに書き込むときのみ
 
 保存先の記録: ${LAST_DIR_FILE}
 現在の保存先: ${TARGET_DIR}
@@ -678,6 +1243,7 @@ while true; do
     MODE=$(fzf_menu "保存先: $(basename "$TARGET_DIR")" \
         "SEARCH   キーワードで検索" \
         "URL      URLを入力" \
+        "LOCAL    手元のファイルを加工（時間指定・音量・CD）" \
         "CONFIG   保存先を変更" \
         "EXIT     終了")
 
@@ -691,6 +1257,11 @@ while true; do
             TARGET_DIR="$NEW_DIR"
             echo "$TARGET_DIR" > "$LAST_DIR_FILE"
         fi
+        continue
+    fi
+
+    if [ "$MODE" == "LOCAL    手元のファイルを加工（時間指定・音量・CD）" ]; then
+        local_menu
         continue
     fi
 
