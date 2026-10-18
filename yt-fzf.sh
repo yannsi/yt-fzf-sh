@@ -8,7 +8,7 @@
 
 # --- 設定 ---
 # バージョン（PKGBUILD の pkgver と同じ値にする）
-VERSION="1.0.6"
+VERSION="1.0.7"
 
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
@@ -57,6 +57,10 @@ LOUDNORM_FILTER="loudnorm=I=-16:TP=-1.5:LRA=11"
 # 時間範囲・拡張子・作業用の一時名（.part など）が付く分の余裕を残して切り詰める。
 TITLE_MAX_BYTES=200        # 全体ダウンロード
 TITLE_MAX_BYTES_RANGE=180  # 範囲指定（ファイル名に時間範囲が付く分を差し引く）
+
+# ストリーミング再生で取得する画質（yt-dlp の -f と同じ書き方）。
+# 重いときは height<=720 などに下げる。音声だけで再生したいときは 'ba' にする。
+STREAM_FORMAT='bv*[height<=1080]+ba/b'
 
 # --- 関数定義 ---
 
@@ -278,10 +282,11 @@ normalize_file() {
     fi
 }
 
-# mpv でストリーミング再生する。
+# yt-dlp で取得しながら mpv でストリーミング再生する。
 # $2 = yes: キャッシュを大きく取る（通常） / no: キャッシュ無効（シークで固まる場合）
+# $3 = ウィンドウに表示するタイトル（省略時は URL）
 play_stream() {
-    local url="$1" cache="$2"
+    local url="$1" cache="$2" title="${3:-$1}"
     local cache_args=(--cache=no)
 
     if ! command -v mpv &>/dev/null; then
@@ -293,15 +298,24 @@ play_stream() {
     [ "$cache" == "yes" ] && cache_args=(--cache=yes --demuxer-max-bytes=500MiB --demuxer-max-back-bytes=150MiB)
 
     show_status "$C_MAIN" "再生中... （Q キーで終了）"
-    mpv \
+
+    # 動画の取得は yt-dlp に任せ、mpv には標準入力で流し込んで再生だけさせる。
+    # （mpv に URL を渡して mpv 側で取得させると、YouTube の待ち時間の指定や
+    #   取得時の IP との一致を満たせず、403 Forbidden で再生できないことがあるため）
+    # mkv で結合して流す（mp4 は途中から読めないのでパイプでは再生できない）
+    : > "$TEMP_PLAYLOG"
+    yt-dlp -q --no-warnings --no-playlist --socket-timeout 10 \
+        -f "$STREAM_FORMAT" --merge-output-format mkv \
+        -o - "$url" 2>> "$TEMP_PLAYLOG" \
+    | mpv \
         --geometry=50% \
         --force-window \
         "${cache_args[@]}" \
-        --network-timeout=10 \
-        --script-opts="ytdl_hook-ytdl_path=$(command -v yt-dlp)" \
-        --ytdl-raw-options="force-ipv4=,no-playlist=" \
-        "$url" > "$TEMP_PLAYLOG" 2>&1
-    local rc=$?
+        --title="$title" \
+        - >> "$TEMP_PLAYLOG" 2>&1
+    # mpv の終了コードで判定する
+    # （Q で mpv を閉じると yt-dlp は送り先がなくなって異常終了するが、これは正常）
+    local rc=${PIPESTATUS[1]}
 
     # 「再生中...」の行を消す（消さないと、再生するたびに画面に積み重なる）
     # \033[1A = 1行上へ、\r = 行頭へ、\033[2K = その行を消去
@@ -309,6 +323,7 @@ play_stream() {
 
     # mpv の終了コード: 0 = 普通に終了（Q / ウィンドウを閉じる）、4 = Ctrl+C など
     # それ以外は再生に失敗しているので、理由がわかるようにエラーを表示する
+    # （yt-dlp が取得に失敗した場合も、mpv は何も受け取れずに失敗で終わる）
     if [ "$rc" -ne 0 ] && [ "$rc" -ne 4 ]; then
         show_status "$C_ERR" "再生できませんでした"
         grep -iE "error|failed|unable" "$TEMP_PLAYLOG" | tail -n 3 | sed 's/^/  /'
@@ -552,9 +567,9 @@ show_action_menu() {
 
         case "$ACTION" in
             "STREAM   ストリーミング再生")
-                play_stream "$url" yes ;;
+                play_stream "$url" yes "$title" ;;
             "STREAM2  ストリーミング再生（シークで固まる場合）")
-                play_stream "$url" no ;;
+                play_stream "$url" no "$title" ;;
             "VIDEO    動画保存")
                 run_download "$url" "video" "$target_dir" "$live_status" ;;
             "AUDIO    音声保存")
