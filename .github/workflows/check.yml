@@ -1,0 +1,42 @@
+# GitHub に送られるたびに、スクリプトの書き間違いを自動で点検する。
+# 結果はリポジトリの「Actions」タブと、各コミットの ✅ / ❌ で確認できる。
+name: 点検
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 文法の点検（bash -n）
+        run: |
+          bash -n yt-fzf.sh
+          bash -n install.sh
+
+      - name: 書き間違い・危ない書き方の点検（shellcheck）
+        run: |
+          shellcheck --version | head -2
+          shellcheck yt-fzf.sh install.sh
+
+      - name: PKGBUILD の点検
+        # PKGBUILD の変数（pkgname など）は makepkg が使うので「使われていない」の指摘は外す
+        run: shellcheck -s bash -e SC2034,SC2154,SC2164 PKGBUILD
+
+      - name: yt-fzf.sh の VERSION と PKGBUILD の pkgver が同じか確かめる
+        run: |
+          v=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' yt-fzf.sh)
+          p=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          echo "yt-fzf.sh の VERSION: ${v:-（見つからない）}"
+          echo "PKGBUILD の pkgver  : ${p:-（見つからない）}"
+          if [ -z "$v" ] || [ "$v" != "$p" ]; then
+            echo "::error::VERSION と pkgver がずれています。両方を同じ版に直してください。"
+            exit 1
+          fi
