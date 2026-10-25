@@ -4,12 +4,14 @@
 # （同じフォルダにある yt-fzf.sh / LICENSE / README.md をパッケージにします）
 
 pkgname=yt-fzf
-pkgver=1.2.1
+pkgver=1.2.2
 pkgrel=1
 pkgdesc="Search, stream and download YouTube videos, edit local audio/video and burn audio CDs from an fzf menu"
 arch=('any')
 url="https://github.com/yannsi/yt-fzf-sh"
 license=('MIT')
+# deno（YouTube の暗号の処理に使う JavaScript 実行環境）は書かなくてよい。
+# Arch では yt-dlp → yt-dlp-ejs → deno と依存で自動的に入る。
 depends=('bash' 'fzf' 'yt-dlp' 'ffmpeg')
 # 以前は yt-fzf-sh という名前でパッケージにしていたため、同じ /usr/bin/yt-fzf を持つ。
 # 入れ替えられるようにしておく（インストール時に yt-fzf-sh を削除するか聞かれる）。

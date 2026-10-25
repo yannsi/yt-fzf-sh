@@ -8,7 +8,7 @@
 
 # --- 設定 ---
 # バージョン（PKGBUILD の pkgver と同じ値にする）
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 CONFIG_DIR="${HOME}/.yt-downloader"
 LAST_DIR_FILE="${CONFIG_DIR}/.last_dir"
@@ -54,6 +54,13 @@ FZF_OPTS=(
 FZF_MENU_OPTS=()
 if fzf --no-input --version &>/dev/null; then
     FZF_MENU_OPTS=(--no-input)
+fi
+
+# fzf 0.66 以降は、選択中の行の左端（ガター）に「▌」が出るようになった。
+# この配色では選択中の行の背景色で十分に分かるので、空白にして隠す。
+# --gutter は 0.66 以降の機能。古い fzf ではこれまでどおり何も足さない。
+if fzf --gutter ' ' --version &>/dev/null; then
+    FZF_OPTS+=(--gutter ' ')
 fi
 
 # 音量正規化の目標値（EBU R128 系。-16 LUFS はスマホ・PC での視聴向け）
@@ -141,6 +148,34 @@ check_dependency() {
     fi
 }
 
+# YouTube 用の JavaScript 実行環境（deno）があるか確かめる。
+# 【経緯】2025年11月から、yt-dlp は YouTube の暗号を解くのに外部の JavaScript
+# 実行環境を使うようになった。無いと選べる画質がかなり減り、将来は YouTube 自体が
+# 使えなくなる予定。yt-dlp が既定で使うのは deno だけ（node などは yt-dlp の設定で
+# --js-runtimes を書いたときだけ使われる）。
+# Arch では yt-dlp → yt-dlp-ejs → deno と依存で自動的に入るので、まず困らない。
+# 他のディストリビューションで入っていない場合に気付けるよう、起動時に一度だけ知らせる。
+# （再生時は --no-warnings を付けているので、yt-dlp 自身の警告は画面に出ない）
+JS_RUNTIME_NOTICE_FILE="${CONFIG_DIR}/.js_runtime_notice_shown"
+has_js_runtime() {
+    command -v deno &>/dev/null
+}
+notice_js_runtime() {
+    has_js_runtime && { rm -f "$JS_RUNTIME_NOTICE_FILE"; return 0; }
+    [ -f "$JS_RUNTIME_NOTICE_FILE" ] && return 0
+    echo -e "\033[38;5;214m[ 注意 ] YouTube 用の JavaScript 実行環境（deno）が見つかりません。\033[0m"
+    echo "  このままでも動きますが、選べる画質が少なくなったり、再生・保存に失敗したりします。"
+    echo "  deno をインストールしてください（Arch: sudo pacman -S deno）。"
+    echo "  node などを使う場合は、yt-dlp の設定ファイルに --js-runtimes を書いてください。"
+    echo "  （この案内は一度だけ表示します。キーを押すと続けます）"
+    : > "$JS_RUNTIME_NOTICE_FILE" 2>/dev/null
+    read -rsn 1
+}
+# 失敗したときの案内に付け足す一言（deno が無いときだけ）
+js_runtime_hint() {
+    has_js_runtime || echo "（deno が入っていないことも原因として考えられます: README の「必要なもの」を参照）"
+}
+
 # 一時ファイルを作成
 TEMP_RESULT=$(mktemp)   # 検索結果
 TEMP_LIST=$(mktemp)     # fzf に渡す一覧
@@ -189,15 +224,24 @@ wait_key() {
 
 # 利用可能なクリップボードツールで文字列をコピーする。
 # コピーできたら 0、ツールが無ければ 1 を返す。
+# 【重要】見つかった最初のツールだけで諦めないこと。wl-clipboard と xclip の
+# 両方が入った X11 のデスクトップでは、wl-copy が先に選ばれて失敗し、
+# 「クリップボードツールが見つかりません」と誤って表示されていた。
+# 今の画面の種類（Wayland / X11）で使えるものから順に試し、だめなら次を試す。
 copy_to_clipboard() {
     local text="$1"
-    if command -v wl-copy &>/dev/null; then
-        printf '%s' "$text" | wl-copy && return 0
-    elif command -v xclip &>/dev/null; then
-        printf '%s' "$text" | xclip -selection clipboard && return 0
-    elif command -v xsel &>/dev/null; then
-        printf '%s' "$text" | xsel --clipboard --input && return 0
-    elif command -v pbcopy &>/dev/null; then
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy &>/dev/null; then
+        printf '%s' "$text" | wl-copy 2>/dev/null && return 0
+    fi
+    if [ -n "${DISPLAY:-}" ]; then
+        if command -v xclip &>/dev/null; then
+            printf '%s' "$text" | xclip -selection clipboard 2>/dev/null && return 0
+        fi
+        if command -v xsel &>/dev/null; then
+            printf '%s' "$text" | xsel --clipboard --input 2>/dev/null && return 0
+        fi
+    fi
+    if command -v pbcopy &>/dev/null; then
         printf '%s' "$text" | pbcopy && return 0
     fi
     return 1
@@ -328,12 +372,26 @@ normalize_file() {
 }
 
 # yt-dlp を更新するコマンド。
-# pacman で入れた yt-dlp は「yt-dlp -U」で更新できないため、入れ方に合わせて案内する
+# 「yt-dlp -U」で更新できるのは配布バイナリだけなので、入れ方に合わせて案内する。
+#   pacman で入れた → sudo pacman -Syu yt-dlp
+#   pipx で入れた   → pipx upgrade yt-dlp
+#   pip で入れた    → python3 -m pip install -U "yt-dlp[default]"
+#                     （[default] で YouTube 用の yt-dlp-ejs も一緒に更新される）
+#   それ以外（配布バイナリ）→ yt-dlp -U
+# pip / pipx で入れたものは Python の起動スクリプトなので、1行目で見分ける。
 ytdlp_update_cmd() {
-    local bin
+    local bin real first=""
     bin=$(command -v yt-dlp)
     if [ -n "$bin" ] && command -v pacman &>/dev/null && pacman -Qqo "$bin" &>/dev/null; then
         echo "sudo pacman -Syu yt-dlp"
+        return
+    fi
+    real=$(realpath "$bin" 2>/dev/null || echo "$bin")
+    [ -f "$real" ] && IFS= read -r first < "$real" 2>/dev/null
+    if [[ "$real" == */pipx/* ]]; then
+        echo "pipx upgrade yt-dlp"
+    elif [[ "$first" == "#!"*python* ]]; then
+        echo "python3 -m pip install -U \"yt-dlp[default]\""
     else
         echo "yt-dlp -U"
     fi
@@ -394,7 +452,7 @@ play_stream() {
     printf '\033[1A\r\033[2K'
 
     # yt-dlp が取得に失敗した場合も、mpv は何も受け取れずに失敗で終わる
-    _report_play_result "$rc" "URL を確認してください。$(ytdlp_update_cmd) で yt-dlp を更新すると直ることがあります。"
+    _report_play_result "$rc" "URL を確認してください。$(ytdlp_update_cmd) で yt-dlp を更新すると直ることがあります。$(js_runtime_hint)"
 }
 
 # 手元のファイルを mpv で再生する（複数なら続けて再生）
@@ -442,7 +500,7 @@ check_not_live() {
             return 1 ;;
     esac
     # 状態が確認できなかったときは通常どおり進める
-    # （ダウンロード時の --match-filter でも配信中の動画は止まる）
+    # （ダウンロード時の --match-filters でも配信中の動画は止まる）
     return 0
 }
 
@@ -573,11 +631,14 @@ do_download() {
     # --no-playlist でプレイリスト付き URL（watch?v=…&list=…）でも選んだ1本だけを保存する
     # --playlist-items 1 は念のための歯止め。プレイリストやチャンネルの URL が
     #   すり抜けてきても、全動画ではなく先頭の1本だけで止める
-    # --match-filter で、ライブ配信中・配信開始前の動画は保存しない（念のための二重チェック。
+    # --match-filters で、ライブ配信中・配信開始前の動画は保存しない（念のための二重チェック。
     #   「!=?」は、配信の状態が分からない動画（YouTube 以外など）は通す、という意味）
+    #   【重要】正式名の --match-filters で書くこと。--match-filter は「途中まで打った
+    #   名前を補う」仕組みでたまたま通っているだけで、似た名前のオプションが
+    #   yt-dlp に増えると、その日からエラーで保存できなくなる。
     yt-dlp -P "$output_dir" "${DL_FORMAT_ARGS[@]}" \
         --no-playlist --playlist-items 1 \
-        --match-filter "live_status!=?is_live & live_status!=?is_upcoming" \
+        --match-filters "live_status!=?is_live & live_status!=?is_upcoming" \
         --embed-metadata --windows-filenames --no-mtime \
         --progress --newline \
         "${DL_SECTION_ARGS[@]}" \
@@ -589,6 +650,7 @@ do_download() {
     if [ "$exit_code" -ne 0 ]; then
         show_status "$C_ERR" "ダウンロードに失敗しました"
         echo "上記のエラーメッセージを確認してください（$(ytdlp_update_cmd) で yt-dlp を更新すると直ることがあります）。"
+        js_runtime_hint
         [ "$wait" == "yes" ] && wait_key
         return 1
     fi
@@ -1490,6 +1552,7 @@ fzf のメニューで YouTube 動画を検索・再生・保存するツール�
 
 必要なもの:
   fzf, yt-dlp, ffmpeg（ffprobe）  必須
+  deno                            YouTube の暗号の処理（無いと画質が減る。Arch では yt-dlp と一緒に入る）
   mpv                             再生するときのみ
   wl-copy / xclip / xsel          URL の自動コピーを使うときのみ
   cdrdao（または cdrecord）       音楽CDに書き込むときのみ（cdrdao なら曲名入り）
@@ -1506,158 +1569,170 @@ EOF
 
 # --- メイン処理 ---
 
-# 起動オプション（ツールが未インストールでもヘルプは見られるよう、依存チェックより前に処理）
-case "$1" in
-    "") ;;
-    -h|--help)
-        show_help
-        exit 0 ;;
-    -v|--version)
-        # 本体の場所も出す（古いものが別の場所にあって優先されていないか確認できるように）
-        echo "yt-fzf v${VERSION}"
-        echo "本体の場所: $(realpath "$0" 2>/dev/null || echo "$0")"
-        exit 0 ;;
-    *)
-        echo "不明なオプション: $1" >&2
-        echo "使い方は $(basename "$0") -h で確認できます。" >&2
-        exit 1 ;;
-esac
+# テストから関数だけを読み込めるよう、メイン処理は関数にまとめ、
+# 直接実行されたときだけ呼ぶ（source yt-fzf.sh では何も始まらない）。
+main() {
 
-# mpv は再生するときだけ必要なので、ここではチェックしない
-check_dependency fzf
-check_dependency yt-dlp
-check_dependency ffmpeg
-check_dependency ffprobe
+    # 起動オプション（ツールが未インストールでもヘルプは見られるよう、依存チェックより前に処理）
+    case "$1" in
+        "") ;;
+        -h|--help)
+            show_help
+            exit 0 ;;
+        -v|--version)
+            # 本体の場所も出す（古いものが別の場所にあって優先されていないか確認できるように）
+            echo "yt-fzf v${VERSION}"
+            echo "本体の場所: $(realpath "$0" 2>/dev/null || echo "$0")"
+            exit 0 ;;
+        *)
+            echo "不明なオプション: $1" >&2
+            echo "使い方は $(basename "$0") -h で確認できます。" >&2
+            exit 1 ;;
+    esac
 
-while true; do
-    MODE=$(fzf_menu "保存先: $(basename "$TARGET_DIR")" \
-        "SEARCH   キーワードで検索" \
-        "URL      URLを入力" \
-        "LOCAL    手元のファイルを加工（時間指定・音量・CD）" \
-        "CONFIG   保存先を変更" \
-        "EXIT     終了")
+    # mpv は再生するときだけ必要なので、ここではチェックしない
+    check_dependency fzf
+    check_dependency yt-dlp
+    check_dependency ffmpeg
+    check_dependency ffprobe
+    notice_js_runtime
 
-    [ -z "$MODE" ] || [ "$MODE" == "EXIT     終了" ] && do_exit
+    while true; do
+        MODE=$(fzf_menu "保存先: $(basename "$TARGET_DIR")" \
+            "SEARCH   キーワードで検索" \
+            "URL      URLを入力" \
+            "LOCAL    手元のファイルを加工（時間指定・音量・CD）" \
+            "CONFIG   保存先を変更" \
+            "EXIT     終了")
 
-    if [ "$MODE" == "CONFIG   保存先を変更" ]; then
-        NEW_DIR=$(select_directory "$TARGET_DIR")
-        [ "$NEW_DIR" == "__EXIT__" ] && do_exit
-        # 念のため、実在するフォルダのときだけ保存先を更新・記録する
-        if [ -d "$NEW_DIR" ]; then
-            TARGET_DIR="$NEW_DIR"
-            echo "$TARGET_DIR" > "$LAST_DIR_FILE"
-        fi
-        continue
-    fi
+        [ -z "$MODE" ] || [ "$MODE" == "EXIT     終了" ] && do_exit
 
-    if [ "$MODE" == "LOCAL    手元のファイルを加工（時間指定・音量・CD）" ]; then
-        local_menu
-        continue
-    fi
-
-    if [ "$MODE" == "URL      URLを入力" ]; then
-        # fzf の入力モードで URL を受け取る
-        URL=$(echo "" | fzf "${FZF_OPTS[@]}" \
-            --header="URL を入力して Enter（ESC で戻る）" \
-            --header-first \
-            --height=30% \
-            --print-query \
-            --no-sort \
-            --query="" | tail -1)
-        URL="${URL//[[:space:]]/}"
-        [ -z "$URL" ] && continue
-        if is_collection_url "$URL"; then
-            show_status "$C_ERR" "プレイリストやチャンネルの URL には対応していません"
-            echo "  動画1本の URL（https://www.youtube.com/watch?v=… など）を入力してください。"
-            echo "  プレイリストを再生中の URL（watch?v=…&list=…）なら、その動画1本だけを扱えます。"
-            wait_key
-            continue
-        fi
-        show_action_menu "$URL" "$TARGET_DIR" "URL 指定の動画"
-        continue
-    fi
-
-    if [ "$MODE" == "SEARCH   キーワードで検索" ]; then
-        QUERY=$(echo "" | fzf "${FZF_OPTS[@]}" \
-            --header="検索キーワードを入力して Enter（ESC で戻る）" \
-            --header-first \
-            --height=30% \
-            --print-query \
-            --no-sort \
-            --query="" | tail -1)
-        [ -z "$QUERY" ] && continue
-
-        show_status "$C_MAIN" "[ 検索中... ]"
-        # 「表示用テキスト<TAB>動画ID<TAB>配信の状態」を1行にまとめる
-        # （同名タイトルが複数あっても、IDが行ごとに紐付くのでズレない）
-        # awk で、配信中・配信予定の動画に印を付け、再生時間が無いときの空の " []" を取る
-        yt-dlp --no-colors --flat-playlist \
-            --print $'[%(uploader,channel|不明)s] %(title)s [%(duration_string|)s]\t%(id)s\t%(live_status|)s' \
-            "ytsearch${SEARCH_COUNT}:$QUERY" 2> "$TEMP_ERR" \
-            | awk -F'\t' 'BEGIN { OFS = "\t" }
-                { sub(/ \[\]$/, "", $1) }
-                $3 == "is_live"     { $1 = "[LIVE] " $1 }
-                $3 == "is_upcoming" { $1 = "[配信予定] " $1 }
-                { print }' > "$TEMP_RESULT"
-
-        # 「[ 検索中... ]」の行を消す（消さないと、検索するたびに画面に積み重なる）
-        printf '\033[1A\r\033[2K'
-
-        if [ ! -s "$TEMP_RESULT" ]; then
-            if grep -q "ERROR" "$TEMP_ERR"; then
-                show_status "$C_ERR" "検索に失敗しました"
-                grep "ERROR" "$TEMP_ERR" | tail -n 3
-                echo "yt-dlp が古い可能性があります。$(ytdlp_update_cmd) で更新してください。"
-                wait_key
-            else
-                show_status "$C_ERR" "検索結果が見つかりませんでした"
-                sleep 1
+        if [ "$MODE" == "CONFIG   保存先を変更" ]; then
+            NEW_DIR=$(select_directory "$TARGET_DIR")
+            [ "$NEW_DIR" == "__EXIT__" ] && do_exit
+            # 念のため、実在するフォルダのときだけ保存先を更新・記録する
+            if [ -d "$NEW_DIR" ]; then
+                TARGET_DIR="$NEW_DIR"
+                echo "$TARGET_DIR" > "$LAST_DIR_FILE"
             fi
             continue
         fi
 
-        while true; do
-            {
-                printf '%s\n' "BACK     検索に戻る"
-                printf '%s\n' "EXIT     終了"
-                cat "$TEMP_RESULT"
-            } > "$TEMP_LIST"
+        if [ "$MODE" == "LOCAL    手元のファイルを加工（時間指定・音量・CD）" ]; then
+            local_menu
+            continue
+        fi
 
-            # --delimiter/--with-nth でタブ以降(ID部分)を非表示にする。
-            # 選択結果には元の行(表示部+タブ+ID)がそのまま返る。
-            # --multi: Tab で複数選ぶと、まとめて保存できる
-            SELECTED=$(fzf "${FZF_OPTS[@]}" \
-                --multi \
-                --header="動画を選択（マウスクリック / ↑↓ / Enter）　Tab で複数選ぶとまとめて保存" \
+        if [ "$MODE" == "URL      URLを入力" ]; then
+            # fzf の入力モードで URL を受け取る
+            URL=$(echo "" | fzf "${FZF_OPTS[@]}" \
+                --header="URL を入力して Enter（ESC で戻る）" \
                 --header-first \
+                --height=30% \
+                --print-query \
                 --no-sort \
-                --delimiter='\t' \
-                --with-nth=1 \
-                --height=80% < "$TEMP_LIST")
-
-            [ -z "$SELECTED" ] && break
-            # BACK / EXIT が混ざっていたら、そちらを優先する
-            grep -qx "EXIT     終了" <<< "$SELECTED" && do_exit
-            grep -qx "BACK     検索に戻る" <<< "$SELECTED" && break
-
-            # 複数選ばれたら、まとめて保存へ
-            if [ "$(grep -c . <<< "$SELECTED")" -gt 1 ]; then
-                mapfile -t SELECTED_LINES <<< "$SELECTED"
-                batch_download "${SELECTED_LINES[@]}"
+                --query="" | tail -1)
+            URL="${URL//[[:space:]]/}"
+            [ -z "$URL" ] && continue
+            if is_collection_url "$URL"; then
+                show_status "$C_ERR" "プレイリストやチャンネルの URL には対応していません"
+                echo "  動画1本の URL（https://www.youtube.com/watch?v=… など）を入力してください。"
+                echo "  プレイリストを再生中の URL（watch?v=…&list=…）なら、その動画1本だけを扱えます。"
+                wait_key
                 continue
             fi
-            SELECTED_LINE="$SELECTED"
+            show_action_menu "$URL" "$TARGET_DIR" "URL 指定の動画"
+            continue
+        fi
 
-            VIDEO_ID=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $2}')
-            DISPLAY_TITLE=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $1}')
-            LIVE_STATUS=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $3}')
-            if [ -z "$VIDEO_ID" ]; then
-                show_status "$C_ERR" "動画 ID の取得に失敗しました"
-                sleep 1; continue
+        if [ "$MODE" == "SEARCH   キーワードで検索" ]; then
+            QUERY=$(echo "" | fzf "${FZF_OPTS[@]}" \
+                --header="検索キーワードを入力して Enter（ESC で戻る）" \
+                --header-first \
+                --height=30% \
+                --print-query \
+                --no-sort \
+                --query="" | tail -1)
+            [ -z "$QUERY" ] && continue
+
+            show_status "$C_MAIN" "[ 検索中... ]"
+            # 「表示用テキスト<TAB>動画ID<TAB>配信の状態」を1行にまとめる
+            # （同名タイトルが複数あっても、IDが行ごとに紐付くのでズレない）
+            # awk で、配信中・配信予定の動画に印を付け、再生時間が無いときの空の " []" を取る
+            # --color no_color: 結果を加工するので色付けの制御文字を入れない
+            # （以前の --no-colors は非表示の古い名前で、いずれ削除されうるため使わない）
+            yt-dlp --color no_color --flat-playlist \
+                --print $'[%(uploader,channel|不明)s] %(title)s [%(duration_string|)s]\t%(id)s\t%(live_status|)s' \
+                "ytsearch${SEARCH_COUNT}:$QUERY" 2> "$TEMP_ERR" \
+                | awk -F'\t' 'BEGIN { OFS = "\t" }
+                    { sub(/ \[\]$/, "", $1) }
+                    $3 == "is_live"     { $1 = "[LIVE] " $1 }
+                    $3 == "is_upcoming" { $1 = "[配信予定] " $1 }
+                    { print }' > "$TEMP_RESULT"
+
+            # 「[ 検索中... ]」の行を消す（消さないと、検索するたびに画面に積み重なる）
+            printf '\033[1A\r\033[2K'
+
+            if [ ! -s "$TEMP_RESULT" ]; then
+                if grep -q "ERROR" "$TEMP_ERR"; then
+                    show_status "$C_ERR" "検索に失敗しました"
+                    grep "ERROR" "$TEMP_ERR" | tail -n 3
+                    echo "yt-dlp が古い可能性があります。$(ytdlp_update_cmd) で更新してください。"
+                    wait_key
+                else
+                    show_status "$C_ERR" "検索結果が見つかりませんでした"
+                    sleep 1
+                fi
+                continue
             fi
 
-            URL="https://www.youtube.com/watch?v=$VIDEO_ID"
-            show_action_menu "$URL" "$TARGET_DIR" "$DISPLAY_TITLE" "$LIVE_STATUS"
-        done
-    fi
-done
+            while true; do
+                {
+                    printf '%s\n' "BACK     検索に戻る"
+                    printf '%s\n' "EXIT     終了"
+                    cat "$TEMP_RESULT"
+                } > "$TEMP_LIST"
+
+                # --delimiter/--with-nth でタブ以降(ID部分)を非表示にする。
+                # 選択結果には元の行(表示部+タブ+ID)がそのまま返る。
+                # --multi: Tab で複数選ぶと、まとめて保存できる
+                SELECTED=$(fzf "${FZF_OPTS[@]}" \
+                    --multi \
+                    --header="動画を選択（マウスクリック / ↑↓ / Enter）　Tab で複数選ぶとまとめて保存" \
+                    --header-first \
+                    --no-sort \
+                    --delimiter='\t' \
+                    --with-nth=1 \
+                    --height=80% < "$TEMP_LIST")
+
+                [ -z "$SELECTED" ] && break
+                # BACK / EXIT が混ざっていたら、そちらを優先する
+                grep -qx "EXIT     終了" <<< "$SELECTED" && do_exit
+                grep -qx "BACK     検索に戻る" <<< "$SELECTED" && break
+
+                # 複数選ばれたら、まとめて保存へ
+                if [ "$(grep -c . <<< "$SELECTED")" -gt 1 ]; then
+                    mapfile -t SELECTED_LINES <<< "$SELECTED"
+                    batch_download "${SELECTED_LINES[@]}"
+                    continue
+                fi
+                SELECTED_LINE="$SELECTED"
+
+                VIDEO_ID=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $2}')
+                DISPLAY_TITLE=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $1}')
+                LIVE_STATUS=$(printf '%s' "$SELECTED_LINE" | awk -F'\t' '{print $3}')
+                if [ -z "$VIDEO_ID" ]; then
+                    show_status "$C_ERR" "動画 ID の取得に失敗しました"
+                    sleep 1; continue
+                fi
+
+                URL="https://www.youtube.com/watch?v=$VIDEO_ID"
+                show_action_menu "$URL" "$TARGET_DIR" "$DISPLAY_TITLE" "$LIVE_STATUS"
+            done
+        fi
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

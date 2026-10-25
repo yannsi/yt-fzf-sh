@@ -20,11 +20,14 @@ jobs:
         run: |
           bash -n yt-fzf.sh
           bash -n install.sh
+          bash -n tests/unit.sh
+          bash -n tests/compat.sh
 
       - name: 書き間違い・危ない書き方の点検（shellcheck）
         run: |
           shellcheck --version | head -2
           shellcheck yt-fzf.sh install.sh
+          shellcheck -x -P SCRIPTDIR tests/unit.sh tests/compat.sh
 
       - name: PKGBUILD の点検
         # PKGBUILD の変数（pkgname など）は makepkg が使うので「使われていない」の指摘は外す
@@ -40,3 +43,6 @@ jobs:
             echo "::error::VERSION と pkgver がずれています。両方を同じ版に直してください。"
             exit 1
           fi
+
+      - name: 単体テスト
+        run: bash tests/unit.sh

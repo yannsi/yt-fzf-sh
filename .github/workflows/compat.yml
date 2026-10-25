@@ -1,0 +1,51 @@
+# 最新の Arch Linux のツールとの互換性チェック（毎週）。
+# yt-fzf.sh を変えていなくても、yt-dlp・fzf・mpv・ffmpeg の更新や
+# Arch のパッケージ名の変更で動かなくなることがある。使う人が気付く前に知るためのもの。
+# 失敗すると GitHub からメールが届く。何が問題かは実行結果の画面に注釈で出る。
+#
+# 【注意】GitHub は、リポジトリに 60 日間 push などの動きが無いと定期実行（schedule）を
+# 自動で止める。止まると GitHub からメールが届くので、「Actions」タブでこの
+# ワークフローを開き「Enable workflow」を押せば再開する。
+name: 互換性の定期チェック
+
+on:
+  schedule:
+    # 毎週月曜 3:47（日本時間）。cron は UTC で書くため日曜 18:47 になる。
+    - cron: "47 18 * * 0"
+  push:
+    paths:
+      - "yt-fzf.sh"
+      - "PKGBUILD"
+      - "tests/compat.sh"
+      - ".github/workflows/compat.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compat:
+    name: 最新の Arch で確認
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ツールを最新にする
+        run: pacman -Syu --noconfirm --needed base-devel fzf yt-dlp ffmpeg mpv cdrdao
+
+      - name: オプション・フィルタ・依存パッケージの確認
+        run: bash tests/compat.sh
+
+      # パッケージとして実際にビルド・インストールできるか（makepkg は root では動かない）
+      - name: makepkg でビルドしてインストール
+        run: |
+          useradd -m builder
+          cp -r . /home/builder/src && chown -R builder: /home/builder/src
+          su builder -c 'cd ~/src && makepkg -f --noconfirm'
+          pacman -U --noconfirm /home/builder/src/yt-fzf-*.pkg.tar.zst
+
+      - name: インストールしたコマンドが起動するか
+        run: |
+          yt-fzf --version
+          yt-fzf --help > /dev/null

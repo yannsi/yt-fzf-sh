@@ -31,10 +31,13 @@
 | [`fzf`](https://github.com/junegunn/fzf) | メニューUIの表示・選択 | 必須 |
 | [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) | 動画情報の取得・ダウンロード | 必須 |
 | `ffmpeg` / `ffprobe` | 動画/音声の結合・変換・音量正規化 | 必須 |
+| [`deno`](https://deno.com/) | YouTube の暗号の処理（yt-dlp が使う JavaScript 実行環境） | 強く推奨（無いと選べる画質が減り、再生・保存に失敗しやすい。Arch では `yt-dlp` と一緒に自動で入る） |
 | [`mpv`](https://mpv.io/) | ストリーミング再生 | 再生するときのみ |
 | `cdrdao` | 音楽CDへの書き込み（曲名入り） | CD に書き込むときのみ（`sudo pacman -S cdrdao`。曲名なしでよければ `cdrecord`（`cdrtools`）/ `wodim` でも可） |
 
 必須のコマンドは起動時に自動でチェックされ、不足していればエラーで終了します。`mpv` は再生を選んだときだけ確認するので、保存だけに使う場合は無くても動きます。
+
+`deno` は、2025年11月から yt-dlp が YouTube のために必要とするようになったものです（[yt-dlp の告知](https://github.com/yt-dlp/yt-dlp/issues/15012)）。無い場合は起動時に一度だけ案内が出ます。`node` などを使いたい場合は、yt-dlp の設定ファイルに `--js-runtimes node` のように書いてください。
 
 ### クリップボードコピー（任意）
 
@@ -100,10 +103,12 @@ bash yt-fzf.sh
 
 ```bash
 sudo apt update
-sudo apt install git fzf mpv ffmpeg
+sudo apt install git fzf mpv ffmpeg unzip
 # yt-dlp は配布バイナリを直接使うのがおすすめ（apt 版は古い場合が多い）
 sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
 sudo chmod a+rx /usr/local/bin/yt-dlp
+# deno（YouTube の暗号の処理に必要。apt に無いことが多いので公式の方法で入れる）
+curl -fsSL https://deno.land/install.sh | sh
 ```
 
 ### ファイル構成
@@ -113,6 +118,8 @@ sudo chmod a+rx /usr/local/bin/yt-dlp
 | `yt-fzf.sh` | 本体 |
 | `PKGBUILD` | 方法1（makepkg）用 |
 | `install.sh` | 方法2（~/.local/bin へのインストール / アンインストール）用 |
+| `tests/unit.sh` | 単体テスト（`bash tests/unit.sh`） |
+| `tests/compat.sh` | 最新の Arch のツールとの互換性チェック（GitHub Actions で毎週実行） |
 | `LICENSE` | ライセンス（MIT） |
 | `docs/demo.gif` | README のデモ画像 |
 
@@ -298,7 +305,7 @@ Linux のファイル名は 255 バイトまでで、日本語は1文字3バイ�
 
 ## 既知の制限
 
-- `--download-sections`（時間指定ダウンロード）は YouTube 側の配信仕様変更の影響を受けやすく、`yt-dlp` が古いと失敗しやすくなります。時間指定を使う場合は `yt-dlp` を最新に更新しておくことを推奨します（`sudo pacman -Syu yt-dlp`（pacman で入れた場合。それ以外は `yt-dlp -U`））。
+- `--download-sections`（時間指定ダウンロード）は YouTube 側の配信仕様変更の影響を受けやすく、`yt-dlp` が古いと失敗しやすくなります。時間指定を使う場合は `yt-dlp` を最新に更新しておくことを推奨します（`sudo pacman -Syu yt-dlp`（pacman で入れた場合。pipx なら `pipx upgrade yt-dlp`、配布バイナリなら `yt-dlp -U`。エラー画面には入れ方に合ったコマンドが表示されます））。
 - 音量正規化は再エンコードを伴うため、M4A / BEST / 動画の音声は、正規化しない場合に比べてわずかに音質が変わります（MP3 はもともと変換するので、変換の回数は増えません。WAV / FLAC は劣化しません）。
 - 動画の範囲指定では、切り出し位置を正確にするため、切り出した部分の映像を再エンコードします。そのぶん時間がかかります。
 - `--flat-playlist` を使った検索では、投稿者名や再生時間が取得できない動画があります（その場合「不明」または空欄で表示されます）。
@@ -308,7 +315,7 @@ Linux のファイル名は 255 バイトまでで、日本語は1文字3バイ�
 | 症状 | 原因と対処 |
 |---|---|
 | 更新したのにメニューが変わらない／枠のタイトルにバージョンが出ない | 古い `yt-fzf` が別の場所に残っていて、そちらが起動しています。`type -a yt-fzf` で場所を確認し、古いもの（`~/.local/bin/yt-fzf` や旧パッケージ `yt-fzf-sh`）を削除してから入れ直し、`hash -r` を実行してください |
-| `Server returned 403 Forbidden` | YouTube 側の仕様変更または `yt-dlp` が古いことが原因。`sudo pacman -Syu yt-dlp`（pacman で入れた場合。それ以外は `yt-dlp -U`） で更新してください。最新でも直らないときは、少し待つと yt-dlp 側の修正版が出ることが多いです |
+| `Server returned 403 Forbidden` | YouTube 側の仕様変更または `yt-dlp` が古いことが原因。`sudo pacman -Syu yt-dlp`（pacman で入れた場合。pipx なら `pipx upgrade yt-dlp`、配布バイナリなら `yt-dlp -U`。エラー画面には入れ方に合ったコマンドが表示されます） で更新してください。最新でも直らないときは、少し待つと yt-dlp 側の修正版が出ることが多いです |
 | 再生時に `[ffmpeg] https: HTTP error 403 Forbidden` と出て再生できない | v1.0.6 以前の再生方式の問題です。v1.0.7 以降に更新してください |
 | 「ダウンロードをスキップしました」と表示される | 保存先に同名ファイルがあります。表示されたパスのファイルを削除・リネームしてから再実行してください |
 | 「検索に失敗しました」と表示される | 表示されたエラーを確認してください。多くの場合 yt-dlp の更新で直ります |
@@ -319,6 +326,7 @@ Linux のファイル名は 255 バイトまでで、日本語は1文字3バイ�
 | 「ディスクが入っていないか、読み取れません」と表示される | 空の CD-R を入れて、ドライブが読み込み終わるまで数秒待ってからやり直してください |
 | `ffmpeg` / `ffprobe` が見つからないというエラー | `ffmpeg` をインストールしてください（`ffprobe` も同梱されています） |
 | クリップボードにコピーされない | `xclip` / `xsel` / `wl-clipboard` のいずれもインストールされていません。画面に表示された URL を手動でコピーしてください |
+| 選べる画質が少ない／「deno が見つかりません」と表示される | YouTube の暗号の処理に使う `deno` がありません。`sudo pacman -S deno`（Arch 以外は「ほかのディストリビューション」を参照）でインストールしてください |
 
 ## 設定ファイル / 一時ファイル
 

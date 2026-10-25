@@ -33,6 +33,10 @@ check_dependencies() {
         command -v "$cmd" &>/dev/null || missing_required+=("$cmd")
     done
     command -v mpv &>/dev/null || missing_optional+=("mpv")
+    # deno: yt-dlp が YouTube の暗号を解くのに使う JavaScript 実行環境。
+    # 無くても起動はできるが、選べる画質が減り、再生・保存に失敗しやすくなる。
+    # （Arch では yt-dlp と一緒に入る。他のディストリビューションでは入らないことがある）
+    command -v deno &>/dev/null || missing_optional+=("deno")
 
     if [ ${#missing_required[@]} -eq 0 ] && [ ${#missing_optional[@]} -eq 0 ]; then
         ok "必要なツールはすべてそろっています。"
@@ -51,8 +55,12 @@ check_dependencies() {
         warn "次の必須ツールが見つかりません: ${missing_required[*]}"
         warn "このままでは yt-fzf を起動できません。"
     fi
-    if [ ${#missing_optional[@]} -gt 0 ]; then
+    if [[ " ${missing_optional[*]} " == *" mpv "* ]]; then
         warn "再生用の mpv が見つかりません（保存だけなら無くても使えます）。"
+    fi
+    if [[ " ${missing_optional[*]} " == *" deno "* ]]; then
+        warn "YouTube 用の JavaScript 実行環境 deno が見つかりません。"
+        warn "無くても動きますが、選べる画質が減り、再生・保存に失敗しやすくなります。"
     fi
 
     echo "インストールするには次のコマンドを実行してください:"
@@ -62,6 +70,9 @@ check_dependencies() {
         echo "  sudo apt install ${pkgs[*]}"
         if [[ " ${pkgs[*]} " == *" yt-dlp "* ]]; then
             echo "  （yt-dlp は apt 版が古いことが多いので、README の配布バイナリを使う方法がおすすめです）"
+        fi
+        if [[ " ${pkgs[*]} " == *" deno "* ]]; then
+            echo "  （deno は apt に無いことがあります。その場合は README の deno の入れ方を参照してください）"
         fi
     else
         echo "  お使いのパッケージマネージャで ${pkgs[*]} をインストールしてください"
